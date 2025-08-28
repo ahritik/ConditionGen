@@ -1,37 +1,27 @@
-#!/usr/bin/env python3
-import argparse, json, numpy as np
-from scipy.signal import welch
+# eval/psd.py
+"""
+Compute PSD band errors between real and synthetic windows.
+"""
+import numpy as np
+import scipy.signal as sps
 
-BANDS = [(0.5,4),(4,8),(8,13),(13,30)]
+BANDS = {"delta": (0.5,4), "theta": (4,8), "alpha": (8,13), "beta": (13,30)}
 
-def band_powers(x, fs):
-    # x: (C,T)
-    f, Pxx = welch(x, fs=fs, nperseg=fs*2, axis=-1)
-    out = []
-    for (a,b) in BANDS:
-        m = (f>=a)&(f<b)
-        out.append(Pxx[:,m].mean(axis=-1))
-    return np.stack(out,0)  # (B,C)
+def bandpower(sig, fs, f1, f2):
+    f, Pxx = sps.welch(sig, fs=fs, nperseg=256)
+    mask = (f>=f1) & (f<=f2)
+    return np.trapz(Pxx[mask], f[mask])
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--real", type=str, required=True, help="NPZ with X,y,...")
-    ap.add_argument("--gen", type=str, required=True, help="NPZ with X,...")
-    ap.add_argument("--fs", type=int, default=200)
-    args = ap.parse_args()
-
-    zr = np.load(args.real, allow_pickle=True); Xr=zr["X"]; meta=zr["meta"].item() if isinstance(zr["meta"],str) else str(zr["meta"])
-    zg = np.load(args.gen, allow_pickle=True); Xg=zg["X"]
-
-    # sample same number
-    n = min(len(Xr), len(Xg))
-    Xr = Xr[:n]; Xg=Xg[:n]
-    pr = np.stack([band_powers(x, args.fs) for x in Xr],0)  # (n,B,C)
-    pg = np.stack([band_powers(x, args.fs) for x in Xg],0)
-
-    rel_err = np.abs(pr - pg) / (np.abs(pr)+1e-8)
-    out = {"rel_psd_err_mean": float(rel_err.mean()), "rel_psd_err_per_band": rel_err.mean(axis=(0,2)).tolist()}
-    print(json.dumps(out, indent=2))
-
-if __name__ == "__main__":
-    main()
+def psd_band_errors(real, synth, fs=200):
+    """
+    real, synth: arrays (N,C,T) normalized.
+    Returns dict of absolute band errors averaged across channels and samples.
+    """
+    errs = {b: [] for b in BANDS}
+    for xr, xs in zip(real, synth):
+        for ch in range(xr.shape[0]):
+            for b,(f1,f2) in BANDS.items():
+                pr = bandpower(xr[ch], fs, f1, f2)
+                ps = bandpower(xs[ch], fs, f1, f2)
+                errs[b].append(abs(pr-ps))
+    return {k: float(np.mean(v)) for k,v in errs.items()}

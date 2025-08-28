@@ -1,42 +1,36 @@
-#!/usr/bin/env python3
-import argparse, json, numpy as np
+# eval/cov_acf.py
+import numpy as np
 
-def corr_mat(x):
-    # x: (C,T)
-    xm = x - x.mean(axis=-1, keepdims=True)
-    xs = xm / (xm.std(axis=-1, keepdims=True)+1e-8)
-    return xs @ xs.T / xs.shape[1]
+def channel_covariance_distance(real, synth):
+    """
+    Computes Frobenius distance between mean channel covariance matrices.
+    """
+    def covs(X):
+        # X: (N,C,T)
+        cov_list = []
+        for x in X:
+            cov_list.append(np.cov(x))
+        return np.mean(cov_list, axis=0)
+    Cr = covs(real)
+    Cs = covs(synth)
+    return float(np.linalg.norm(Cr - Cs, ord="fro"))
 
-def acf_dist(x, L=200):
-    # x: (C,T)
-    C,T = x.shape
-    d=0.0; n=0
-    for c in range(C):
-        s = x[c]
-        s = (s - s.mean())/(s.std()+1e-8)
-        acf = np.correlate(s, s, mode="full")[T-1:T+L] / np.arange(T, T-L, -1)
-        # target: identity (1 at lag0, near 0 later); compare across sets later
-        # here just return energy beyond lag0 as simple proxy
-        d += float(np.sum(acf[1:]**2)); n+=1
-    return d/n
-
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--real", type=str, required=True)
-    ap.add_argument("--gen", type=str, required=True)
-    args = ap.parse_args()
-
-    zr = np.load(args.real, allow_pickle=True); Xr=zr["X"]
-    zg = np.load(args.gen, allow_pickle=True); Xg=zg["X"]
-    n = min(len(Xr), len(Xg))
-    Xr = Xr[:n]; Xg=Xg[:n]
-    Cr = np.stack([corr_mat(x) for x in Xr],0).mean(0)
-    Cg = np.stack([corr_mat(x) for x in Xg],0).mean(0)
-    frob = float(np.sqrt(((Cr-Cg)**2).sum()))
-    acf_r = np.mean([acf_dist(x) for x in Xr])
-    acf_g = np.mean([acf_dist(x) for x in Xg])
-    out = {"corr_frobenius": frob, "acf_energy_r": acf_r, "acf_energy_g": acf_g}
-    print(json.dumps(out, indent=2))
-
-if __name__ == "__main__":
-    main()
+def acf_distance(real, synth, max_lag=50):
+    """
+    Mean absolute difference of autocorrelation up to max_lag.
+    """
+    def acf(sig, max_lag):
+        sig = sig - sig.mean()
+        ac = np.correlate(sig, sig, mode="full")
+        mid = len(ac)//2
+        ac = ac[mid:mid+max_lag+1]
+        ac = ac / (ac[0] + 1e-8)
+        return ac
+    diffs = []
+    for xr, xs in zip(real, synth):
+        C = xr.shape[0]
+        for c in range(C):
+            ar = acf(xr[c], max_lag)
+            as_ = acf(xs[c], max_lag)
+            diffs.append(np.abs(ar - as_).mean())
+    return float(np.mean(diffs))

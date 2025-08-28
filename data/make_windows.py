@@ -1,204 +1,150 @@
-#!/usr/bin/env python3
-import argparse, os, re, json, math, warnings
+# data/make_windows.py
+"""
+Create 4s windows @ 200Hz from TUAR EDFs + per-file CSV annotations.
+
+This is a pragmatic script; adapt the paths/columns for your TUAR layout.
+Requires: mne, pandas, numpy
+"""
+import os, argparse, json
 import numpy as np
-from pathlib import Path
-from collections import defaultdict
-from typing import Dict, List, Tuple, Optional
+import pandas as pd
 import mne
+from utils.constants import CANON_CH, ARTIFACT_SET, tuar_label_to_artifact, MONTAGE_IDS
 
-ARTIFACT_SET = ["none","eye","muscle","chewing","shiver","electrode","movement"]
+def find_edf_csv_pairs(root):
+    pairs = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        for f in filenames:
+            if f.lower().endswith(".edf"):
+                edf_path = os.path.join(dirpath, f)
+                csv_path = os.path.splitext(edf_path)[0] + ".csv"
+                if os.path.isfile(csv_path):
+                    pairs.append((edf_path, csv_path))
+    return pairs
 
-CANON_CH = ["Fp1","Fp2","C3","C4","P3","P4","O1","O2"]
-
-def parse_args():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--tuar_root", type=str, required=True, help="Root folder containing EDF files")
-    ap.add_argument("--ann_csv", type=str, default=None, help="Optional annotations CSV (edf_path,start_sec,end_sec,artifact)")
-    ap.add_argument("--out", type=str, required=True, help="Output NPZ path")
-    ap.add_argument("--fs", type=int, default=200)
-    ap.add_argument("--win_s", type=float, default=4.0)
-    ap.add_argument("--overlap", type=float, default=0.5)
-    ap.add_argument("--bandpass", type=float, nargs=2, default=[0.5,45.0])
-    ap.add_argument("--notch", type=float, default=60.0)
-    ap.add_argument("--canon_ch", type=str, nargs="+", default=CANON_CH)
-    ap.add_argument("--subject_regex", type=str, default=r"(?P<subject>[^/\\]+)")
-    ap.add_argument("--seed", type=int, default=13)
-    return ap.parse_args()
-
-def find_edf_files(root: str) -> List[str]:
-    exts = (".edf",".bdf",".gdf")
-    files = []
-    for dirpath, _, fnames in os.walk(root):
-        for f in fnames:
-            if f.lower().endswith(exts):
-                files.append(os.path.join(dirpath,f))
-    return sorted(files)
-
-def load_annotations_csv(csv_path: str) -> Dict[str, List[Tuple[float,float,str]]]:
-    if csv_path is None:
-        return {}
-    rows = defaultdict(list)
-    with open(csv_path,"r") as f:
-        header = f.readline().strip().split(",")
-        cols = {h:i for i,h in enumerate(header)}
-        for line in f:
-            if not line.strip(): continue
-            parts = line.strip().split(",")
-            edf = parts[cols["edf_path"]]
-            t0 = float(parts[cols["start_sec"]]); t1 = float(parts[cols["end_sec"]])
-            lab = parts[cols["artifact"]].strip().lower()
-            if lab not in ARTIFACT_SET:
-                lab = "none"
-            rows[edf].append((t0,t1,lab))
-    return rows
-
-def map_channels(raw: mne.io.BaseRaw, canon_ch: List[str]) -> Tuple[np.ndarray, np.ndarray]:
-    # Return data (C,T) mapped to canonical order; missing channels zero-filled, mask indicates present
-    present = []
-    for ch in canon_ch:
-        if ch in raw.ch_names:
-            present.append(True)
-        else:
-            # try variants like 'EEG Fp1-Ref' etc.
-            found = None
-            for name in raw.ch_names:
-                base = name.replace("EEG","").replace("-Ref","").replace("-LE","").replace("-A1","").strip()
-                if base == ch:
-                    found = name; break
-            present.append(found is not None)
-    data = []
+def channel_map(raw):
+    chs = {ch.upper(): i for i,ch in enumerate(raw.ch_names)}
+    idxs = []
     mask = []
-    for ok, ch in zip(present, canon_ch):
-        if ok:
-            pick = mne.pick_channels(raw.ch_names, include=[ch], ordered=False)
-            if len(pick)==0:
-                # try relaxed match
-                for name in raw.ch_names:
-                    base = name.replace("EEG","").replace("-Ref","").replace("-LE","").replace("-A1","").strip()
-                    if base == ch:
-                        pick = mne.pick_channels(raw.ch_names, include=[name], ordered=False)
-                        break
-            x = raw.get_data(picks=pick)
-            data.append(x[0])
+    for ch in CANON_CH:
+        if ch.upper() in chs:
+            idxs.append(chs[ch.upper()])
             mask.append(1.0)
         else:
-            data.append(np.zeros(raw.n_times, dtype=np.float32))
+            idxs.append(0)   # dummy index
             mask.append(0.0)
-    return np.stack(data,0).astype(np.float32), np.array(mask, dtype=np.float32)
-
-def segment_windows(x: np.ndarray, fs: int, win_s: float, overlap: float):
-    C,T = x.shape
-    win = int(win_s*fs)
-    hop = int(win*(1.0-overlap))
-    idx = []
-    for start in range(0, T-win+1, hop):
-        idx.append((start, start+win))
-    return idx
-
-def per_window_label(segments: List[Tuple[float,float,str]], t0: float, t1: float) -> str:
-    # Any-overlap strategy; choose majority by duration if multiple
-    if not segments: return "none"
-    votes = defaultdict(float)
-    for (s0, s1, lab) in segments:
-        inter = max(0.0, min(t1,s1)-max(t0,s0))
-        if inter > 0:
-            votes[lab] += inter
-    if not votes: return "none"
-    return max(votes.items(), key=lambda kv: kv[1])[0]
-
-def compute_intensity(win: np.ndarray, fs: int) -> float:
-    # Simple RMS normalized within-recording later; here return RMS
-    return float(np.sqrt(np.mean(win**2)))
+    return np.array(idxs), np.array(mask, dtype=np.float32)
 
 def main():
-    args = parse_args()
-    np.random.seed(args.seed)
-    files = find_edf_files(args.tuar_root)
-    ann = load_annotations_csv(args.ann_csv)
-    if len(files)==0:
-        raise SystemExit(f"No EDF-like files found under {args.tuar_root}")
-    print(f"Found {len(files)} recordings")
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--tuar_root", type=str, required=True, help="Path to TUAR root")
+    ap.add_argument("--out_npz", type=str, required=True, help="Output NPZ file (windows)")
+    ap.add_argument("--fs", type=int, default=200)
+    ap.add_argument("--win_sec", type=float, default=4.0)
+    ap.add_argument("--overlap", type=float, default=0.5)
+    ap.add_argument("--bandpass", type=str, default="0.5,45.0")
+    args = ap.parse_args()
 
-    X, Y, INT, SUBJ, MASK = [], [], [], [], []
-    meta = {"artifact_set": ARTIFACT_SET, "canon_ch": args.canon_ch, "fs": args.fs, "win_s": args.win_s, "overlap": args.overlap}
-    subj_map = {}
-    subj_re = re.compile(args.subject_regex)
+    fs = args.fs
+    win = int(args.win_sec * fs)
+    hop = int(win * (1.0 - args.overlap))
+    lo, hi = [float(x) for x in args.bandpass.split(",")]
 
-    for i,edf in enumerate(files):
-        print(f"[{i+1}/{len(files)}] {edf}")
+    pairs = find_edf_csv_pairs(args.tuar_root)
+    X, artifact, intensity, seizure, age_bin, montage_id = [], [], [], [], [], []
+
+    for edf_path, csv_path in pairs:
         try:
-            raw = mne.io.read_raw_edf(edf, preload=True, verbose="ERROR")
+            raw = mne.io.read_raw_edf(edf_path, preload=True, verbose=False)
         except Exception as e:
-            print("  !! skip (read error):", e); continue
+            print(f"[WARN] EDF read failed {edf_path}: {e}")
+            continue
 
-        # Filter chain
+        raw.resample(fs)
+        raw.filter(lo, hi, verbose=False)
+
+        idxs, mask_vec = channel_map(raw)
+        data = raw.get_data(picks=idxs)  # (C, T)
+        C, T = data.shape
+        # z-score per channel
+        data = (data - data.mean(axis=1, keepdims=True)) / (data.std(axis=1, keepdims=True) + 1e-6)
+        # apply mask
+        data = data * mask_vec[:,None]
+
+        # Load annotations (very dataset specific; here we expect start/stop secs + label)
         try:
-            if args.notch>0:
-                raw.notch_filter(freqs=[args.notch], picks='eeg')
-            raw.filter(l_freq=args.bandpass[0], h_freq=args.bandpass[1], picks='eeg')
+            df = pd.read_csv(csv_path)
         except Exception as e:
-            print("  !! filter error, skipping:", e); continue
+            print(f"[WARN] CSV read failed {csv_path}: {e}")
+            continue
 
-        # Resample
-        try:
-            raw.resample(args.fs)
-        except Exception as e:
-            print("  !! resample error, skipping:", e); continue
+        # Expected columns; adapt as needed
+        # start_time, stop_time, label (artifact), seizure (0/1), age (years or bin)
+        if not set(["start_time","stop_time","label"]).issubset(df.columns):
+            print(f"[WARN] CSV missing columns: {csv_path}")
+            continue
 
-        # Map channels
-        x, mask = map_channels(raw, args.canon_ch)  # (C,T)
-        # Z-score per channel (robust)
-        x = (x - np.median(x, axis=1, keepdims=True)) / (np.std(x, axis=1, keepdims=True)+1e-8)
+        # Create a per-sample artifact timeline (naive: choose the strongest label overlapping the window center)
+        # We'll map to canonical artifact index and a crude intensity [0..1] proportional to coverage.
+        for s in range(0, T - win + 1, hop):
+            e = s + win
+            mid = (s + e) / 2.0 / fs  # seconds
+            window = data[:, s:e]
+            # default cond
+            art_idx = ARTIFACT_SET.index("none")
+            art_int = 0.0
+            seiz = 0.0
+            ageb = 2  # unknown->adult
+            montage = MONTAGE_IDS["canon8"]
 
-        # Subject id
-        m = subj_re.search(edf.replace("\\","/"))
-        sid = m.group("subject") if m and "subject" in m.groupdict() else Path(edf).parts[-2]
-        if sid not in subj_map: subj_map[sid] = len(subj_map)
-        sid_i = subj_map[sid]
+            overlapping = df[(df["start_time"] <= mid) & (df["stop_time"] >= mid)]
+            if len(overlapping) > 0:
+                # pick first row; or compute coverage-based intensity
+                r = overlapping.iloc[0]
+                art = tuar_label_to_artifact(str(r.get("label","none")))
+                art_idx = ARTIFACT_SET.index(art)
+                # crude intensity: fraction of window overlapped by annotated segment (if available)
+                st = float(r.get("start_time", mid))
+                et = float(r.get("stop_time", mid))
+                cover = max(0.0, min(et, e/fs) - max(st, s/fs)) / (win/fs)
+                art_int = float(np.clip(cover, 0.0, 1.0))
+                seiz = float(r.get("seizure", 0.0))
+                # map age to bin if available
+                a = r.get("age", np.nan)
+                if not pd.isna(a):
+                    a = float(a)
+                    if a < 13: ageb = 0
+                    elif a < 25: ageb = 1
+                    elif a < 60: ageb = 2
+                    else: ageb = 3
 
-        # Annotation segments for file
-        segs = ann.get(edf, [])
-        idx = segment_windows(x, args.fs, args.win_s, args.overlap)
+            X.append(window.astype(np.float32))
+            artifact.append(art_idx)
+            intensity.append([art_int])
+            seizure.append([seiz])
+            age_bin.append(ageb)
+            montage_id.append(montage)
 
-        # Per-recording RMS stats for intensity normalization
-        rms_all = []
+    if len(X) == 0:
+        print("No windows created. Check your TUAR paths and CSV schema.")
+        return
 
-        for (a,b) in idx:
-            win = x[:,a:b]  # (C,win)
-            t0, t1 = a/args.fs, b/args.fs
-            lab = per_window_label(segs, t0, t1)
-            y = ARTIFACT_SET.index(lab) if lab in ARTIFACT_SET else 0
-            rms = compute_intensity(win, args.fs)
-            rms_all.append(rms)
+    X = np.stack(X, axis=0)  # (N,C,T)
+    artifact = np.array(artifact, dtype=np.int64)
+    intensity = np.array(intensity, dtype=np.float32)
+    seizure = np.array(seizure, dtype=np.float32)
+    age_bin = np.array(age_bin, dtype=np.int64)
+    montage_id = np.array(montage_id, dtype=np.int64)
 
-        # normalize RMS to [0,1] within recording
-        if len(rms_all)==0: continue
-        rmin, rmax = float(np.percentile(rms_all, 5)), float(np.percentile(rms_all, 95))
-        p = 0
-        for (a,b) in idx:
-            win = x[:,a:b]
-            t0, t1 = a/args.fs, b/args.fs
-            lab = per_window_label(segs, t0, t1)
-            y = ARTIFACT_SET.index(lab) if lab in ARTIFACT_SET else 0
-            rms = np.clip((rms_all[p]-rmin)/(rmax-rmin+1e-8), 0.0, 1.0)
-            p+=1
-            X.append(win.astype(np.float32))
-            Y.append(y)
-            INT.append(float(rms))
-            SUBJ.append(sid_i)
-            MASK.append(mask.astype(np.float32))
-
-    if len(X)==0:
-        raise SystemExit("No windows produced. Check annotations or channel mapping.")
-
-    X = np.stack(X,0)      # (N,C,T)
-    Y = np.array(Y, np.int64)
-    INT = np.array(INT, np.float32)
-    SUBJ = np.array(SUBJ, np.int64)
-    MASK = np.stack(MASK,0)  # (N,C)
-
-    np.savez_compressed(args.out, X=X, y=Y, intensity=INT, subject=SUBJ, ch_mask=MASK, meta=json.dumps(meta), subjects=json.dumps(subj_map))
-    print("Saved:", args.out, "shape:", X.shape)
-
+    os.makedirs(os.path.dirname(args.out_npz), exist_ok=True)
+    np.savez_compressed(args.out_npz,
+        x=X,
+        artifact=artifact,
+        intensity=intensity,
+        seizure=seizure,
+        age_bin=age_bin,
+        montage_id=montage_id
+    )
+    print(f"Wrote {args.out_npz} with {X.shape[0]} windows.")
 if __name__ == "__main__":
     main()

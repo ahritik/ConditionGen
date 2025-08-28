@@ -1,0 +1,12 @@
+{
+  "counts": {
+    "none": 35,
+    "eye": 36,
+    "muscle": 39,
+    "chewing": 42,
+    "shiver": 37,
+    "electrode": 30,
+    "movement": 37
+  },
+  "N": 256
+}
