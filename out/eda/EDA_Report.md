@@ -1,10 +1,44 @@
 # EDA Report
 
-## NPZ Summary
-- Windows: 179567
+## Meta
+- Sampling rate (fs): 200 Hz
+- Window length: 4.0 s
+- Sampled windows (for plots): 179567
 
-### Artifact counts
-{'none': 89796, 'eye': 25210, 'muscle': 38262, 'chewing': 2374, 'shiver': 151, 'electrode': 23774, 'movement': 0}
+## Totals
+- train: 106583
+- val: 36782
+- test: 36202
 
-### Intensity histogram (10 bins)
-[89782, 0, 0, 0, 0, 0, 0, 0, 0, 89785]
+## Class Balance (train)
+- chewing: 1962 (1.84%)
+- electrode: 12497 (11.73%)
+- eye: 16504 (15.48%)
+- muscle: 20646 (19.37%)
+- none: 54927 (51.53%)
+- shiver: 47 (0.04%)
+
+- **Seizure prevalence** (train/val/test): train: 0.110, val: 0.036, test: 0.240
+
+## Age & Montage (train)
+- 2: 106583
+
+- 0: 106583
+
+## Band Power (overall)
+- delta: 0.05684
+- theta: 0.01104
+- alpha: 0.008287
+- beta: 0.002672
+
+## Figures
+- Artifact distribution (train): `artifact_distribution_train.png`
+- Intensity histogram (train): `intensity_hist_train.png`
+- Age bin distribution (train): `agebin_distribution_train.png`
+- Seizure prevalence per split: `seizure_prevalence.png`
+- Welch PSD (overall): `psd_overall.png`
+- Welch PSD by artifact: `psd_by_artifact.png`
+- Mean channel covariance: `covariance_mean.png`
+- Mean ACF: `acf_mean.png`
+- Band power (overall): `band_power_overall.png`
+

@@ -87,7 +87,7 @@ def main():
     if args.resume:
         start_step, _ = load_ckpt(args.resume, model, opt, ema)
 
-    scaler = torch.cuda.amp.GradScaler(enabled=torch.cuda.is_available())
+    scaler = torch.amp.GradScaler('cuda', enabled=torch.cuda.is_available())
     use_mps = (device.type == "mps")
     amp_enabled = use_mps or torch.cuda.is_available()
 

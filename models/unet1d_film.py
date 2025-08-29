@@ -58,32 +58,37 @@ class Up(nn.Module):
         self.rb2 = ResBlock(co, cond_dim, d=2)
     def forward(self, x, skip, cond):
         x = self.up(x)
+        # align lengths if off by one due to stride/padding
+        if x.size(-1) != skip.size(-1):
+            T = min(x.size(-1), skip.size(-1))
+            x = x[..., :T]
+            skip = skip[..., :T]
         x = x + skip
         x = self.rb1(x, cond)
         x = self.rb2(x, cond)
         return x
+
 
 class UNet1DFiLM(nn.Module):
     def __init__(self, c_in=8, c_hidden=(64,128,256), cond_dim=128):
         super().__init__()
         c1, c2, c3 = c_hidden
         self.inp = nn.Conv1d(c_in, c1, 3, padding=1)
-        self.d1 = Down(c1, c2, cond_dim)
-        self.d2 = Down(c2, c3, cond_dim)
+        self.d1 = Down(c1, c2, cond_dim)  # L -> L/2
+        self.d2 = Down(c2, c3, cond_dim)  # L/2 -> L/4
         self.mid1 = ResBlock(c3, cond_dim, d=2)
         self.mid2 = ResBlock(c3, cond_dim, d=4)
-        self.u1 = Up(c3, c2, cond_dim)
-        self.u2 = Up(c2, c1, cond_dim)
+        self.u1 = Up(c3, c2, cond_dim)    # L/4 -> L/2  (skip with d1)
+        self.u2 = Up(c2, c1, cond_dim)    # L/2 -> L    (skip with x1)
         self.out = nn.Conv1d(c1, c_in, 3, padding=1)
 
     def forward(self, x, cond_vec):
-        # cond_vec: [B, cond_dim] already projected before if needed
-        x1 = self.inp(x)
-        s1 = self.d1(x1, cond_vec)
-        s2 = self.d2(s1, cond_vec)
-        m  = self.mid1(s2, cond_vec)
+        x1 = self.inp(x)                  # [B,c1,L]
+        d1 = self.d1(x1, cond_vec)        # [B,c2,L/2]
+        d2 = self.d2(d1, cond_vec)        # [B,c3,L/4]
+        m  = self.mid1(d2, cond_vec)
         m  = self.mid2(m, cond_vec)
-        u1 = self.u1(m, s2, cond_vec)
-        u2 = self.u2(u1, s1, cond_vec)
+        u1 = self.u1(m, d1, cond_vec)     # up to L/2, add skip d1
+        u2 = self.u2(u1, x1, cond_vec)    # up to L,   add skip x1
         out = self.out(u2)
         return out
