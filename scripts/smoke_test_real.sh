@@ -1,29 +1,10 @@
 #!/usr/bin/env bash
 set -e
-
-TUAR_ROOT=${1:-"/Users/hritikarasu/Developer/TUAR"}
-echo "=== ConditionGen real TUAR smoke ==="
-echo "Using TUAR_ROOT=$TUAR_ROOT"
-
-mkdir -p out/real
-
-# EDA of TUAR
-python scripts/eda_tuar.py --tuar_root "$TUAR_ROOT" --out_json out/eda/tuar_summary.json
-
-# Windows
-python data/make_windows.py --tuar_root "$TUAR_ROOT" --out_npz out/real/train.npz --fs 200 --win_sec 4.0 --overlap 0.5
-
-# NPZ EDA
-python scripts/eda_npz.py --npz out/real/train.npz --out_dir out/eda
-
-# Report
-python scripts/eda_report.py --tuar_json out/eda/tuar_summary.json --npz_json out/eda/npz_summary.json --out_md out/eda/EDA_Report.md --to_html
-
-# Train (short)
-python train.py --npz out/real/train.npz --out_dir out/real_run --steps 1000 --ckpt_every 500 --log_tb
-
-# Sample
-CKPT=$(ls out/real_run/ckpt_*.pt | tail -n1)
-python sample.py --ckpt "$CKPT" --n 8 --length 800 --channels 8 --steps 20 --sampler heun2 --out_npz out/real/samples.npz --use_ema
-
-echo "Real smoke complete."
+TUAR_ROOT=${1:-/Users/hritikarasu/Developer/TUAR}
+python data/make_windows.py --tuar_root "$TUAR_ROOT" --out_dir out/npz --fs 200 --win_sec 4 --overlap 0.5 --bandpass 0.5 45 --notch 60 --montage_id 0
+python scripts/eda_npz.py --npz_dir out/npz --out_dir out/eda
+python train.py --npz_dir out/npz --log_dir out/condgen --batch 32 --steps 10000 --ckpt_every 2000 --log_tb
+python sample.py --ckpt out/condgen/checkpoints/step_008000_ema.pt --n 64 --steps 20 --use_ema --artifact eye --intensity 0.8 --seizure 0 --age_bin 1 --montage_id 0 --out_dir out/samples_eye08
+python eval/psd.py --real_dir out/npz --fake_dir out/samples_eye08 --out out/metrics_psd.json
+python eval/cov_acf.py --real_dir out/npz --fake_dir out/samples_eye08 --out out/metrics_cov_acf.json
+python eval/classifier_eval.py --real_dir out/npz --task artifact --augment_with out/samples_eye08 --out out/augment_gain_artifact.json

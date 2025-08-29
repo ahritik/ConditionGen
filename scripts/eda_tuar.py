@@ -1,36 +1,19 @@
-# scripts/eda_tuar.py
-import os, argparse, json
-import pandas as pd
+import os, glob, json, argparse, pandas as pd
+from utils.constants import ARTIFACT_SET
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--tuar_root", type=str, required=True)
-    ap.add_argument("--out_json", type=str, default="out/eda/tuar_summary.json")
+    ap.add_argument("--tuar_root", required=True)
+    ap.add_argument("--out_dir", required=True)
     args = ap.parse_args()
-
-    os.makedirs(os.path.dirname(args.out_json), exist_ok=True)
-    total_csv = 0
-    total_rows = 0
-    labels = {}
-
-    for dirpath, dirnames, filenames in os.walk(args.tuar_root):
-        for f in filenames:
-            if f.endswith(".csv"):
-                total_csv += 1
-                p = os.path.join(dirpath, f)
-                try:
-                    df = pd.read_csv(p)
-                except:
-                    continue
-                total_rows += len(df)
-                if "label" in df.columns:
-                    for v, cnt in df["label"].value_counts().to_dict().items():
-                        labels[v] = labels.get(v, 0) + int(cnt)
-
-    summary = {"csv_files": total_csv, "rows": total_rows, "label_counts": labels}
-    with open(args.out_json, "w") as f:
-        json.dump(summary, f, indent=2)
-    print(f"Wrote {args.out_json}")
+    edfs = sorted(glob.glob(os.path.join(args.tuar_root, "**/*.edf"), recursive=True))
+    csvs = [os.path.splitext(e)[0]+".csv" for e in edfs]
+    n_csv = sum(os.path.exists(c) for c in csvs)
+    stats = {"n_edf": len(edfs), "n_csv": int(n_csv)}
+    os.makedirs(args.out_dir, exist_ok=True)
+    with open(os.path.join(args.out_dir, "tuar_summary.json"), "w") as f:
+        json.dump(stats, f, indent=2)
+    print(stats)
 
 if __name__ == "__main__":
     main()

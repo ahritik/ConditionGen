@@ -1,220 +1,117 @@
-# models/diffusion.py
-"""
-Diffusion core with cosine noise schedule, v-prediction, SNR-weighted loss,
-and DDIM / Heun2 samplers.
-"""
-from dataclasses import dataclass
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import math
+import math, torch, torch.nn as nn, torch.nn.functional as F
 
-# -----------------------
-# Noise schedule (cosine)
-# -----------------------
-def _alpha_bar_cosine(t, s=0.008):
-    # t in [0,1]
-    return torch.cos((t + s) / (1 + s) * math.pi / 2) ** 2
+def cosine_beta_schedule(timesteps, s=0.008):
+    steps = timesteps + 1
+    x = torch.linspace(0, timesteps, steps)
+    alphas_cumprod = torch.cos(((x / timesteps) + s) / (1 + s) * math.pi * 0.5) ** 2
+    alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
+    betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
+    return torch.clamp(betas, 1e-5, 0.999)
 
-@dataclass
-class Schedule:
-    betas: torch.Tensor
-    alphas: torch.Tensor
-    alpha_bars: torch.Tensor
-    sigmas: torch.Tensor
-
-def make_cosine_schedule(T: int, device):
-    ts = torch.linspace(0, 1, T+1, device=device)
-    ab = _alpha_bar_cosine(ts)  # length T+1
-    ab = torch.clamp(ab, 1e-5, 0.99999)
-    betas = 1 - (ab[1:] / ab[:-1])
-    alphas = 1.0 - betas
-    alpha_bars = torch.cumprod(alphas, dim=0)
-    sigmas = torch.sqrt(betas)
-    return Schedule(betas=betas, alphas=alphas, alpha_bars=alpha_bars, sigmas=sigmas)
-
-# -----------------------
-# v-pred helpers
-# -----------------------
-def x0_from_x_t_v(x_t, v, alpha_bar_t):
-    # DDPM relationship (Imagen-style v-pred):
-    # v = sqrt(alpha_bar)*eps - sqrt(1-alpha_bar)*x0
-    # solve for x0
-    sqrt_ab = torch.sqrt(alpha_bar_t)
-    sqrt_1mab = torch.sqrt(1 - alpha_bar_t)
-    x0 = (sqrt_ab * x_t - v) / sqrt_1mab
-    return x0
-
-def eps_from_x_t_v(x_t, v, alpha_bar_t):
-    sqrt_ab = torch.sqrt(alpha_bar_t)
-    sqrt_1mab = torch.sqrt(1 - alpha_bar_t)
-    eps = (v + sqrt_1mab * x_t) / sqrt_ab
-    return eps
-
-# -----------------------
-# EMA
-# -----------------------
 class EMA:
-    def __init__(self, model: nn.Module, decay=0.999):
-        self.decay = decay
-        self.shadow = {k: p.clone().detach() for k,p in model.state_dict().items()}
-
+    def __init__(self, model, beta=0.999):
+        self.beta = beta
+        self.shadow = [p.detach().clone() for p in model.parameters() if p.requires_grad]
     @torch.no_grad()
-    def update(self, model: nn.Module):
-        for k,p in model.state_dict().items():
-            self.shadow[k].mul_(self.decay).add_(p.detach(), alpha=1-self.decay)
+    def update(self, model):
+        i = 0
+        for p in model.parameters():
+            if not p.requires_grad: continue
+            self.shadow[i].mul_(self.beta).add_(p, alpha=1-self.beta)
+            i += 1
+    def copy_to(self, model):
+        i = 0
+        for p in model.parameters():
+            if not p.requires_grad: continue
+            p.data.copy_(self.shadow[i])
+            i += 1
 
-    @torch.no_grad()
-    def copy_to(self, model: nn.Module):
-        model.load_state_dict(self.shadow, strict=True)
+def stft_l1(x, y, n_fft=256, hop_length=128, win_length=256):
+    # Compute L1 distance between magnitude STFTs, averaged over channels
+    # x,y: [B,C,T]
+    B,C,T = x.shape
+    loss = 0.0
+    for c in range(C):
+        X = torch.stft(x[:,c,:], n_fft=n_fft, hop_length=hop_length, win_length=win_length, return_complex=True)
+        Y = torch.stft(y[:,c,:], n_fft=n_fft, hop_length=hop_length, win_length=win_length, return_complex=True)
+        loss = loss + (X.abs() - Y.abs()).abs().mean()
+    return loss / C
 
-# -----------------------
-# Loss (SNR-weighted MSE + lambda * STFT-L1 optional)
-# -----------------------
-def snr_weight(alpha_bar_t):
-    # Following "Improved Denoising Diffusion..." style weighting
-    # weight = min(SNR, cap) where SNR = alpha_bar / (1-alpha_bar)
-    snr = alpha_bar_t / (1 - alpha_bar_t + 1e-8)
-    return torch.clamp(snr, 0., 5.)
-
-def stft_l1(x, y, n_fft=128, hop_length=64):
-    # Simple STFT L1 distance across channels
-    # x,y: (B,C,T)
-    import torch
-    import torch.fft as fft
-    win = torch.hann_window(n_fft, device=x.device).unsqueeze(0)  # (1,n_fft)
-    def _spec(z):
-        # strided windows
-        B,C,T = z.shape
-        unfold = z.unfold(dimension=2, size=n_fft, step=hop_length)  # (B,C,nw,n_fft)
-        win_z = unfold * win.unsqueeze(0).unsqueeze(0)
-        spec = torch.view_as_complex(torch.fft.rfft(win_z, dim=-1))  # (B,C,nw, n_fft//2+1)
-        mag = spec.abs()
-        return mag
-    return ( _spec(x) - _spec(y) ).abs().mean()
-
-class Diffusion(nn.Module):
-    def __init__(self, model: nn.Module, T=1000, stft_lambda=0.1, device='cpu'):
+class Diffusion1D(nn.Module):
+    """
+    v-prediction objective with cosine schedule. Supports DDIM sampling.
+    """
+    def __init__(self, model, timesteps=1000, stft_lambda=0.1, stft_cfg=(128,64,128)):
         super().__init__()
         self.model = model
-        self.T = T
+        self.timesteps = timesteps
+        betas = cosine_beta_schedule(timesteps).float()
+        alphas = 1. - betas
+        alphas_cumprod = torch.cumprod(alphas, dim=0)
+        alphas_cumprod_prev = torch.cat([torch.tensor([1.], dtype=torch.float32), alphas_cumprod[:-1]], dim=0)
+
+        self.register_buffer('betas', betas)
+        self.register_buffer('alphas_cumprod', alphas_cumprod)
+        self.register_buffer('alphas_cumprod_prev', alphas_cumprod_prev)
+
+        self.register_buffer('sqrt_alphas_cumprod', torch.sqrt(alphas_cumprod))
+        self.register_buffer('sqrt_one_minus_alphas_cumprod', torch.sqrt(1. - alphas_cumprod))
+
+        self.register_buffer('c0', torch.sqrt(alphas_cumprod))
+        self.register_buffer('c1', torch.sqrt(1 - alphas_cumprod))
+
         self.stft_lambda = stft_lambda
-        self.register_buffer('t_sched_dummy', torch.tensor(0.))  # just to bind device
-        self.schedule = None
-        self._build_schedule()
+        self.stft_cfg = stft_cfg  # (n_fft, hop, win)
 
-    def _build_schedule(self):
-        device = self.t_sched_dummy.device
-        self.schedule = make_cosine_schedule(self.T, device=device)
+    def q_sample(self, x0, t, noise=None):
+        if noise is None:
+            noise = torch.randn_like(x0)
+        sqrt_cum = self.sqrt_alphas_cumprod[t].view(-1,1,1)
+        sqrt_om  = self.sqrt_one_minus_alphas_cumprod[t].view(-1,1,1)
+        return sqrt_cum * x0 + sqrt_om * noise
 
-    def _gammas_betas_per_block(self, cond_embed_module, cond_dict, num_blocks):
-        # build a list of (gamma, beta) pairs, one per ResBlock (down+mid+up approx.)
-        gamma, beta = cond_embed_module(cond_dict)  # (B, film_dim)
-        # replicate for as many blocks as needed
-        return [(gamma, beta)] * num_blocks
-
-    def forward(self, x0, cond_dict):
-        """
-        Training loss for one batch.
-        x0: (B,C,T) target clean signal
-        cond_dict: conditioning tensors
-        """
-        B = x0.shape[0]
-        device = x0.device
-        # random t per sample
-        t = torch.randint(0, self.T, (B,), device=device)
-        alpha_bar_t = self.schedule.alpha_bars[t].view(B,1,1)
-        sqrt_ab = torch.sqrt(alpha_bar_t)
-        sqrt_1mab = torch.sqrt(1 - alpha_bar_t)
-
-        # sample noise
-        eps = torch.randn_like(x0)
-        x_t = sqrt_ab * x0 + sqrt_1mab * eps
-
-        # predict v
-        v = self.model(x_t, self._all_block_cond(cond_dict))
-
-        # v-target
-        v_target = sqrt_ab * eps - sqrt_1mab * x0
-
-        w = snr_weight(alpha_bar_t)
-        mse = ((v - v_target)**2).mean(dim=(1,2)) * w.squeeze()
-        loss_mse = mse.mean()
-
+    def forward(self, x0, cond_vec, t):
+        noise = torch.randn_like(x0)
+        xt = self.q_sample(x0, t, noise)
+        # v-pred uses v = alpha_t * noise - sqrt(1-alpha_t) * x0
+        at = self.sqrt_alphas_cumprod[t].view(-1,1,1)
+        omt = self.sqrt_one_minus_alphas_cumprod[t].view(-1,1,1)
+        v_target = at * noise - omt * x0
+        v_pred = self.model(xt, cond_vec)
+        mse = F.mse_loss(v_pred, v_target)
         if self.stft_lambda > 0:
-            x0_pred = x0_from_x_t_v(x_t, v, alpha_bar_t)
-            loss_stft = stft_l1(x0_pred, x0)
-        else:
-            loss_stft = torch.tensor(0., device=device)
-
-        loss = loss_mse + self.stft_lambda * loss_stft
-        return loss, {"loss_mse": loss_mse.detach(), "loss_stft": loss_stft.detach()}
-
-    def _all_block_cond(self, cond_dict):
-        # Model expects a list of gammas/betas for each ResBlock traversal.
-        # For simplicity, produce a fixed-length list inferred from model structure.
-        # We'll approximate: total blocks = len(downs_res) + 1(mid) + len(ups_res)
-        # Here we set an attribute on the model after first call to cache this number.
-        if not hasattr(self.model, "_approx_num_blocks"):
-            # Heuristic: count ResBlocks
-            n = 0
-            for m in self.model.modules():
-                class_name = m.__class__.__name__
-                if class_name == "ResBlock":
-                    n += 1
-            self.model._approx_num_blocks = n + 1  # +1 for mid
-        # Use the model's film_provider (ConditionEmbed) for FiLM dim inference
-        gamma, beta = self.model.film_provider(cond_dict)
-        gb = [(gamma, beta)] * self.model._approx_num_blocks
-        return gb
+            # reconstruct x0_pred from v_pred and xt
+            x0_pred = at * xt - omt * v_pred
+            s_cfg = self.stft_cfg
+            l_spec = stft_l1(x0_pred, x0, n_fft=s_cfg[0], hop_length=s_cfg[1], win_length=s_cfg[2])
+            return mse + self.stft_lambda * l_spec, {"mse":mse.item(), "stft": l_spec.item()}
+        return mse, {"mse":mse.item()}
 
     @torch.no_grad()
-    def ddim_sample(self, x_T, cond_dict, steps=50, eta=0.0):
+    def ddim_sample(self, shape, cond_vec, steps=50, eta=0.0, guidance_scale=0.0, cond_null=None, device="cpu"):
         """
-        Non-ancestral DDIM sampling (eta ~ 0); predicts v and steps down.
+        guidance_scale: classifier-free guidance; if >0, we require cond_null vector to mix.
         """
-        device = x_T.device
-        t_seq = torch.linspace(self.T-1, 0, steps, device=device).long()
-        x = x_T
-        for i, t in enumerate(t_seq):
-            ab_t = self.schedule.alpha_bars[t]
-            ab_prev = self.schedule.alpha_bars[max(t-1, 0)]
-            x_in = x
-            v = self.model(x_in, self._all_block_cond(cond_dict))
-            x0 = x0_from_x_t_v(x_in, v, ab_t)
-            # DDIM update
-            sigma_t = eta * torch.sqrt((1 - ab_prev) / (1 - ab_t) * (1 - ab_t/ab_prev))
-            dir_xt = torch.sqrt(ab_prev) * x0 + torch.sqrt(1 - ab_prev - sigma_t**2) * eps_from_x_t_v(x_in, v, ab_t)
-            if sigma_t > 0:
-                noise = torch.randn_like(x)
-                x = dir_xt + sigma_t * noise
+        b = shape[0]
+        x = torch.randn(shape, device=device)
+        ts = torch.linspace(self.timesteps-1, 0, steps, device=device, dtype=torch.long)
+        for i in range(steps):
+            t = ts[i].long().expand(b)
+            at = self.sqrt_alphas_cumprod[t].view(-1,1,1)
+            omt = self.sqrt_one_minus_alphas_cumprod[t].view(-1,1,1)
+            if guidance_scale > 0 and cond_null is not None:
+                v_cond = self.model(x, cond_vec)
+                v_null = self.model(x, cond_null)
+                v = v_null + guidance_scale * (v_cond - v_null)
             else:
-                x = dir_xt
-        return x
-
-    @torch.no_grad()
-    def heun2_sample(self, x_T, cond_dict, steps=20):
-        """
-        Heun's 2nd order sampler in t-space (coarse but fast).
-        """
-        device = x_T.device
-        t_seq = torch.linspace(self.T-1, 0, steps, device=device).long()
-        x = x_T
-        for i, t in enumerate(t_seq):
-            ab_t = self.schedule.alpha_bars[t]
-            v1 = self.model(x, self._all_block_cond(cond_dict))
-            # Euler
-            eps1 = eps_from_x_t_v(x, v1, ab_t)
-            # Predict next x (coarse)
-            if i+1 < len(t_seq):
-                t_next = t_seq[i+1]
+                v = self.model(x, cond_vec)
+            x0_pred = at * x - omt * v
+            if i == steps-1:
+                x = x0_pred
             else:
-                t_next = torch.tensor(0, device=device)
-            ab_n = self.schedule.alpha_bars[t_next]
-            x_euler = torch.sqrt(ab_n) * x0_from_x_t_v(x, v1, ab_t) + torch.sqrt(1 - ab_n) * eps1
-            # Corrector
-            v2 = self.model(x_euler, self._all_block_cond(cond_dict))
-            eps2 = eps_from_x_t_v(x_euler, v2, ab_n)
-            eps_avg = 0.5*(eps1 + eps2)
-            x = torch.sqrt(ab_n) * x0_from_x_t_v(x, v2, ab_t) + torch.sqrt(1 - ab_n) * eps_avg
+                t_next = ts[i+1].long().expand(b)
+                at_next = self.sqrt_alphas_cumprod[t_next].view(-1,1,1)
+                omt_next = self.sqrt_one_minus_alphas_cumprod[t_next].view(-1,1,1)
+                # DDIM deterministic update (eta=0)
+                x = at_next * x0_pred + omt_next * v
         return x

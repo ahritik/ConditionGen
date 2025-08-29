@@ -1,161 +1,89 @@
-# models/unet1d_film.py
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-
-class DepthwiseSeparableConv1d(nn.Module):
-    def __init__(self, in_ch, out_ch, kernel_size=3, dilation=1, stride=1, padding=None):
-        super().__init__()
-        if padding is None:
-            padding = (kernel_size // 2) * dilation
-        self.depthwise = nn.Conv1d(in_ch, in_ch, kernel_size, stride=stride, padding=padding, dilation=dilation, groups=in_ch, bias=False)
-        self.pointwise = nn.Conv1d(in_ch, out_ch, kernel_size=1, bias=True)
-
-    def forward(self, x):
-        x = self.depthwise(x)
-        x = self.pointwise(x)
-        return x
+import torch, torch.nn as nn
+from einops import rearrange
 
 class FiLM(nn.Module):
-    def __init__(self, channels):
+    def __init__(self, hidden, cond_dim):
         super().__init__()
-        self.channels = channels
+        self.to_gamma_beta = nn.Sequential(
+            nn.SiLU(), nn.Linear(cond_dim, hidden*2)
+        )
+    def forward(self, x, cond):
+        gb = self.to_gamma_beta(cond)
+        gamma, beta = gb.chunk(2, dim=-1)
+        gamma = rearrange(gamma, 'b c -> b c 1')
+        beta  = rearrange(beta, 'b c -> b c 1')
+        return x * (1 + gamma) + beta
 
-    def forward(self, x, gamma, beta):
-        # x: (B,C,T), gamma/beta: (B,C)
-        # reshape gamma/beta to (B,C,1)
-        return x * (1 + gamma.unsqueeze(-1)) + beta.unsqueeze(-1)
+class DWConv1d(nn.Module):
+    def __init__(self, c, k=5, d=1):
+        super().__init__()
+        self.pad = nn.ReplicationPad1d(((k-1)*d)//2)
+        self.dw = nn.Conv1d(c, c, k, groups=c, dilation=d, padding=0)
+        self.pw = nn.Conv1d(c, c, 1)
+    def forward(self, x):  # [B,C,T]
+        return self.pw(self.dw(self.pad(x)))
 
 class ResBlock(nn.Module):
-    def __init__(self, ch, cond_dim=None, dilation=1):
+    def __init__(self, c, cond_dim, d=1):
         super().__init__()
-        self.conv1 = DepthwiseSeparableConv1d(ch, ch, kernel_size=3, dilation=dilation)
-        self.conv2 = DepthwiseSeparableConv1d(ch, ch, kernel_size=3, dilation=1)
-        self.norm1 = nn.GroupNorm(8, ch)
-        self.norm2 = nn.GroupNorm(8, ch)
-        self.act = nn.SiLU()
-        self.film = FiLM(ch)
-
-    def forward(self, x, gamma, beta):
-        h = self.norm1(x)
-        h = self.act(h)
-        h = self.conv1(h)
-        h = self.film(h, gamma, beta)
-        h = self.norm2(h)
-        h = self.act(h)
-        h = self.conv2(h)
-        return x + h
+        self.conv1 = DWConv1d(c, k=5, d=d)
+        self.act1 = nn.SiLU()
+        self.film1 = FiLM(c, cond_dim)
+        self.conv2 = DWConv1d(c, k=5, d=d)
+        self.act2 = nn.SiLU()
+        self.film2 = FiLM(c, cond_dim)
+        self.skip = nn.Identity()
+    def forward(self, x, cond):
+        h = self.conv1(x); h = self.act1(h); h = self.film1(h, cond)
+        h = self.conv2(h); h = self.act2(h); h = self.film2(h, cond)
+        return h + self.skip(x)
 
 class Down(nn.Module):
-    def __init__(self, in_ch, out_ch):
+    def __init__(self, ci, co, cond_dim):
         super().__init__()
-        self.conv = nn.Conv1d(in_ch, out_ch, kernel_size=3, stride=2, padding=1)
-
-    def forward(self, x):
-        return self.conv(x)
+        self.proj = nn.Conv1d(ci, co, 3, stride=2, padding=1)
+        self.rb1 = ResBlock(co, cond_dim, d=1)
+        self.rb2 = ResBlock(co, cond_dim, d=2)
+    def forward(self, x, cond):
+        x = self.proj(x)
+        x = self.rb1(x, cond)
+        x = self.rb2(x, cond)
+        return x
 
 class Up(nn.Module):
-    def __init__(self, in_ch, out_ch):
+    def __init__(self, ci, co, cond_dim):
         super().__init__()
-        self.conv = nn.ConvTranspose1d(in_ch, out_ch, kernel_size=4, stride=2, padding=1)
-
-    def forward(self, x):
-        return self.conv(x)
+        self.up = nn.ConvTranspose1d(ci, co, 4, stride=2, padding=1)
+        self.rb1 = ResBlock(co, cond_dim, d=1)
+        self.rb2 = ResBlock(co, cond_dim, d=2)
+    def forward(self, x, skip, cond):
+        x = self.up(x)
+        x = x + skip
+        x = self.rb1(x, cond)
+        x = self.rb2(x, cond)
+        return x
 
 class UNet1DFiLM(nn.Module):
-    """
-    A small 1D UNet with FiLM modulation per block.
-    Input: (B, C, T) -> predicts v (velocity) for v-pred diffusion.
-    """
-    def __init__(self, in_channels=8, base=64, widths=(64,128,256), num_res_blocks=2, film_provider=None):
+    def __init__(self, c_in=8, c_hidden=(64,128,256), cond_dim=128):
         super().__init__()
-        self.in_channels = in_channels
-        self.base = base
-        self.widths = widths
-        self.num_res_blocks = num_res_blocks
-        self.film_provider = film_provider
+        c1, c2, c3 = c_hidden
+        self.inp = nn.Conv1d(c_in, c1, 3, padding=1)
+        self.d1 = Down(c1, c2, cond_dim)
+        self.d2 = Down(c2, c3, cond_dim)
+        self.mid1 = ResBlock(c3, cond_dim, d=2)
+        self.mid2 = ResBlock(c3, cond_dim, d=4)
+        self.u1 = Up(c3, c2, cond_dim)
+        self.u2 = Up(c2, c1, cond_dim)
+        self.out = nn.Conv1d(c1, c_in, 3, padding=1)
 
-        self.in_conv = nn.Conv1d(in_channels, widths[0], kernel_size=3, padding=1)
-
-        # Down path
-        downs = []
-        ch = widths[0]
-        for w in widths:
-            for _ in range(num_res_blocks):
-                downs.append(ResBlock(w))
-            if w != widths[-1]:
-                downs.append(Down(w, w*2))
-        self.downs = nn.ModuleList(downs)
-
-        # Middle
-        mid_ch = widths[-1]*2 if len(widths) > 1 else widths[-1]
-        self.mid_in = nn.Conv1d(widths[-1], mid_ch, kernel_size=3, padding=1)
-        self.mid_rb = ResBlock(mid_ch, dilation=2)
-        self.mid_out = nn.Conv1d(mid_ch, widths[-1], kernel_size=3, padding=1)
-
-        # Up path
-        ups = []
-        up_ws = list(widths)[::-1]
-        ch = widths[-1]
-        for i, w in enumerate(up_ws):
-            for _ in range(num_res_blocks):
-                ups.append(ResBlock(ch + w))  # skip concat
-            if i != len(up_ws) - 1:
-                ups.append(Up(ch + w, ch // 2))
-                ch = ch // 2
-        self.ups = nn.ModuleList(ups)
-
-        # Out
-        self.out_norm = nn.GroupNorm(8, ch + widths[0])
-        self.out_act = nn.SiLU()
-        self.out_conv = nn.Conv1d(ch + widths[0], in_channels, kernel_size=3, padding=1)
-
-    def forward(self, x, gammas_betas):
-        """
-        gammas_betas: list of (gamma, beta) tensors for each ResBlock encountered (down + mid + up + out pre).
-        We will pop from the list in order.
-        """
-        gb_iter = iter(gammas_betas)
-
-        skips = []
-        h = self.in_conv(x)
-
-        # Down path
-        down_feats = []
-        idx = 0
-        for mod in self.downs:
-            if isinstance(mod, ResBlock):
-                gamma, beta = next(gb_iter)
-                h = mod(h, gamma, beta)
-                down_feats.append(h)
-            else:
-                skips.append(h)
-                h = mod(h)
-
-        # Middle
-        h = self.mid_in(h)
-        gamma, beta = next(gb_iter)
-        h = self.mid_rb(h, gamma, beta)
-        h = self.mid_out(h)
-
-        # Up path
-        up_skips = list(reversed(down_feats[:len(self.ups)]))  # approximate matching
-        k = 0
-        for mod in self.ups:
-            if isinstance(mod, ResBlock):
-                skip = up_skips[k] if k < len(up_skips) else None
-                if skip is not None:
-                    h = torch.cat([h, skip], dim=1)
-                gamma, beta = next(gb_iter)
-                h = mod(h, gamma, beta)
-                k += 1
-            else:
-                h = mod(h)
-
-        # Final
-        if len(skips) > 0:
-            h = torch.cat([h, skips[0]], dim=1)  # fuse earliest skip
-        h = self.out_norm(h)
-        h = self.out_act(h)
-        v = self.out_conv(h)
-        return v
+    def forward(self, x, cond_vec):
+        # cond_vec: [B, cond_dim] already projected before if needed
+        x1 = self.inp(x)
+        s1 = self.d1(x1, cond_vec)
+        s2 = self.d2(s1, cond_vec)
+        m  = self.mid1(s2, cond_vec)
+        m  = self.mid2(m, cond_vec)
+        u1 = self.u1(m, s2, cond_vec)
+        u2 = self.u2(u1, s1, cond_vec)
+        out = self.out(u2)
+        return out

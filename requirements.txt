@@ -1,8 +1,13 @@
 numpy
-pandas
 scipy
+pandas
 matplotlib
-torch>=2.1.0
 mne
-markdown
+tqdm
+einops
+torch>=2.2
+torchaudio>=2.2
+scikit-learn
 tensorboard
+psutil
+pyyaml

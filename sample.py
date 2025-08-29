@@ -1,68 +1,73 @@
-# sample.py
-import os, argparse, torch, numpy as np
+import os, argparse, json, numpy as np, torch
 from models.unet1d_film import UNet1DFiLM
-from models.conditioning import ConditionEmbed
-from models.diffusion import Diffusion
-from utils.constants import ARTIFACT_SET, MONTAGE_IDS
+from models.diffusion import Diffusion1D, EMA
+from utils.constants import ARTIFACT_SET
+
+def get_device():
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    return torch.device("cpu")
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--ckpt", type=str, required=True)
-    ap.add_argument("--n", type=int, default=16)
-    ap.add_argument("--length", type=int, default=800, help="Samples length T (e.g., 4s@200Hz=800)")
-    ap.add_argument("--channels", type=int, default=8)
-    ap.add_argument("--widths", type=str, default="64,128,256")
-    ap.add_argument("--sampler", type=str, default="heun2", choices=["heun2","ddim"])
+    ap.add_argument("--ckpt", required=True)
+    ap.add_argument("--n", type=int, default=32)
     ap.add_argument("--steps", type=int, default=20)
     ap.add_argument("--use_ema", action="store_true")
-    ap.add_argument("--out_npz", type=str, default="out/samples.npz")
     ap.add_argument("--artifact", type=str, default="none", choices=ARTIFACT_SET)
-    ap.add_argument("--intensity", type=float, default=0.0)
+    ap.add_argument("--intensity", type=float, default=0.5)
     ap.add_argument("--seizure", type=int, default=0)
     ap.add_argument("--age_bin", type=int, default=2)
-    ap.add_argument("--montage", type=str, default="canon8")
-    ap.add_argument("--device", type=str, default="auto", choices=["auto","cpu","cuda","mps"])
+    ap.add_argument("--montage_id", type=int, default=0)
+    ap.add_argument("--guidance", type=float, default=2.0)
+    ap.add_argument("--out_dir", type=str, default="out/samples")
     args = ap.parse_args()
 
-    if args.device == "auto":
-        device = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
-    else:
-        device = args.device
+    device = get_device()
+    os.makedirs(args.out_dir, exist_ok=True)
 
-    widths = tuple(int(x) for x in args.widths.split(","))
-    film_provider = ConditionEmbed(film_dim=widths[0])
-    net = UNet1DFiLM(in_channels=args.channels, widths=widths, num_res_blocks=2, film_provider=film_provider).to(device)
-    diff = Diffusion(net, T=1000, stft_lambda=0.0, device=device).to(device)
+    cond_dim = len(ARTIFACT_SET) + 1 + 4 + 1
+    net = UNet1DFiLM(c_in=8, c_hidden=(64,128,256), cond_dim=cond_dim)
+    model = Diffusion1D(net, timesteps=1000, stft_lambda=0.0)
+    ckpt = torch.load(args.ckpt, map_location="cpu")
+    model.load_state_dict(ckpt["model"])
+    if args.use_ema and ckpt.get("ema") is not None:
+        # Load EMA weights into model
+        i = 0
+        for p in model.parameters():
+            if not p.requires_grad: continue
+            p.data.copy_(ckpt["ema"][i])
+            i += 1
 
-    ck = torch.load(args.ckpt, map_location="cpu")
-    diff.load_state_dict(ck["diff"])
-    if args.use_ema:
-        # copy EMA weights into model
-        shadow = ck["ema"]
-        diff.load_state_dict(shadow, strict=False)
+    model = model.to(device)
+    model.eval()
 
-    # Build cond dict
+    B = args.n
+    T = 800  # 4s@200Hz
+    C = 8
+
+    # Build cond and null-cond for guidance
     art_idx = ARTIFACT_SET.index(args.artifact)
-    montage_id = MONTAGE_IDS.get(args.montage, 0)
+    art_onehot = torch.zeros(B, len(ARTIFACT_SET), device=device); art_onehot[:, art_idx] = 1.0
+    seiz = torch.full((B,1), float(args.seizure), device=device)
+    age = torch.zeros(B,4, device=device); age[:, args.age_bin] = 1.0
+    mont = torch.full((B,1), float(args.montage_id), device=device)
+    cond = torch.cat([art_onehot, seiz, age, mont], dim=-1)
+    cond_null = torch.cat([torch.nn.functional.one_hot(torch.tensor(0, device=device), num_classes=len(ARTIFACT_SET)).float().unsqueeze(0).repeat(B,1),
+                           torch.zeros(B,1, device=device),
+                           torch.zeros(B,4, device=device),
+                           mont], dim=-1)
 
-    cond = {
-        "artifact": torch.full((args.n,), art_idx, dtype=torch.long, device=device),
-        "intensity": torch.full((args.n,1), float(args.intensity), dtype=torch.float32, device=device),
-        "seizure": torch.full((args.n,1), float(args.seizure), dtype=torch.float32, device=device),
-        "age_bin": torch.full((args.n,), int(args.age_bin), dtype=torch.long, device=device),
-        "montage_id": torch.full((args.n,), int(montage_id), dtype=torch.long, device=device),
-    }
+    with torch.no_grad():
+        x = model.ddim_sample((B,C,T), cond, steps=args.steps, guidance_scale=args.guidance, cond_null=cond_null, device=device)
 
-    x_T = torch.randn(args.n, args.channels, args.length, device=device)
-    if args.sampler == "heun2":
-        x = diff.heun2_sample(x_T, cond, steps=args.steps)
-    else:
-        x = diff.ddim_sample(x_T, cond, steps=args.steps, eta=0.0)
-
-    X = x.detach().cpu().numpy()
-    os.makedirs(os.path.dirname(args.out_npz), exist_ok=True)
-    np.savez_compressed(args.out_npz, x=X)
-    print(f"Wrote samples to {args.out_npz}")
+    np.save(os.path.join(args.out_dir, "samples.npy"), x.cpu().numpy())
+    meta = {k: getattr(args, k) for k in vars(args)}
+    with open(os.path.join(args.out_dir, "meta.json"), "w") as f:
+        json.dump(meta, f, indent=2)
+    print(f"Saved samples to {args.out_dir}")
 
 if __name__ == "__main__":
     main()

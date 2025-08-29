@@ -1,132 +1,150 @@
-# train.py
-import os, argparse, time, csv, math
-import torch
-import torch.nn as nn
-from torch.utils.tensorboard import SummaryWriter
+import os, csv, math, argparse, time, json
 import numpy as np
+import torch, torch.nn as nn
+from torch.utils.data import DataLoader
+from tqdm import tqdm
+from torch.utils.tensorboard import SummaryWriter
 
-from data.loaders_tuar_tusz import make_loader
+from data.loaders_tuar_tusz import NPZShardDataset
 from models.unet1d_film import UNet1DFiLM
-from models.conditioning import ConditionEmbed
-from models.diffusion import Diffusion, EMA
+from models.diffusion import Diffusion1D, EMA
 from utils.constants import ARTIFACT_SET
 
-def autocast_maybe(device_type="cpu", enabled=True):
-    from contextlib import nullcontext
-    if not enabled:
-        return nullcontext()
-    if device_type == "mps":
-        return torch.autocast(device_type="mps", dtype=torch.float16)
-    elif device_type == "cuda":
-        return torch.autocast(device_type="cuda", dtype=torch.float16)
-    else:
-        return nullcontext()
+def get_device():
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    return torch.device("cpu")
+
+def save_ckpt(path, model, opt, ema, step, args):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    ckpt = {
+        "model": model.state_dict(),
+        "opt": opt.state_dict(),
+        "ema": ema.shadow if ema is not None else None,
+        "step": step,
+        "args": vars(args)
+    }
+    torch.save(ckpt, path)
+
+def load_ckpt(path, model, opt=None, ema=None):
+    ckpt = torch.load(path, map_location="cpu")
+    model.load_state_dict(ckpt["model"])
+    if opt is not None and ckpt.get("opt"):
+        opt.load_state_dict(ckpt["opt"])
+    if ema is not None and ckpt.get("ema"):
+        # Load EMA into current EMA object
+        for s, tgt in zip(ckpt["ema"], ema.shadow):
+            tgt.copy_(s)
+    return ckpt.get("step", 0), ckpt.get("args", {})
+
+def collate(batch):
+    # Pad/truncate to the same T (should already be identical)
+    x = torch.stack([b["x"] for b in batch], dim=0)  # [B,C,T]
+    # Build cond vector expected by UNet: here we directly use provided cond_vec
+    # Additionally, we pass intensity as part of cond vector (last dim could be montage scalar; leave as is)
+    cond_vecs = []
+    for b in batch:
+        cond_vecs.append(b["cond_vec"])
+    cond = torch.stack(cond_vecs, dim=0)
+    return x, cond
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--npz", type=str, required=True, help="Path to training NPZ created by make_windows.py")
-    ap.add_argument("--out_dir", type=str, default="out")
-    ap.add_argument("--batch_size", type=int, default=32)
+    ap.add_argument("--npz_dir", required=True)
+    ap.add_argument("--log_dir", required=True)
+    ap.add_argument("--batch", type=int, default=32)
+    ap.add_argument("--steps", type=int, default=200000)
     ap.add_argument("--lr", type=float, default=1e-4)
-    ap.add_argument("--steps", type=int, default=100000)
+    ap.add_argument("--lambda_stft", type=float, default=0.1)
+    ap.add_argument("--stft_win", type=int, default=128)
+    ap.add_argument("--stft_hop", type=int, default=64)
     ap.add_argument("--ckpt_every", type=int, default=5000)
-    ap.add_argument("--log_tb", action="store_true", help="Enable TensorBoard logging")
-    ap.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume")
-    ap.add_argument("--widths", type=str, default="64,128,256")
-    ap.add_argument("--stft_lambda", type=float, default=0.1)
-    ap.add_argument("--device", type=str, default="auto", choices=["auto","cpu","cuda","mps"])
+    ap.add_argument("--log_tb", action="store_true")
+    ap.add_argument("--resume", type=str, default="")
     args = ap.parse_args()
 
-    if args.device == "auto":
-        device = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
-    else:
-        device = args.device
+    device = get_device()
+    os.makedirs(args.log_dir, exist_ok=True)
+    csv_path = os.path.join(args.log_dir, "train_log.csv")
+    tb = SummaryWriter(args.log_dir) if args.log_tb else None
 
-    loader = make_loader(args.npz, batch_size=args.batch_size, shuffle=True, num_workers=0 if device=="mps" else 2, pin_memory=False)
-    widths = tuple(int(x) for x in args.widths.split(","))
+    train_ds = NPZShardDataset(args.npz_dir, split="train")
+    val_ds   = NPZShardDataset(args.npz_dir, split="val")
+    train_loader = DataLoader(train_ds, batch_size=args.batch, shuffle=True, num_workers=2, collate_fn=collate, drop_last=True)
+    val_loader   = DataLoader(val_ds, batch_size=args.batch, shuffle=False, num_workers=2, collate_fn=collate, drop_last=False)
 
-    # Build model + cond embed + diffusion
-    film_provider = ConditionEmbed(film_dim=widths[0])
-    net = UNet1DFiLM(in_channels=loader.dataset.x.shape[1], widths=widths, num_res_blocks=2, film_provider=film_provider).to(device)
-    diff = Diffusion(net, T=1000, stft_lambda=args.stft_lambda, device=device).to(device)
+    cond_dim = (len(ARTIFACT_SET) + 1 + 4 + 1)
+    net = UNet1DFiLM(c_in=8, c_hidden=(64,128,256), cond_dim=cond_dim)
+    model = Diffusion1D(net, timesteps=1000, stft_lambda=args.lambda_stft, stft_cfg=(args.stft_win, args.stft_hop, args.stft_win))
 
-    opt = torch.optim.AdamW(diff.parameters(), lr=args.lr)
-    ema = EMA(diff, decay=0.999)
-
-    # Logging
-    os.makedirs(args.out_dir, exist_ok=True)
-    csv_path = os.path.join(args.out_dir, "train_log.csv")
-    csv_f = open(csv_path, "a", newline="")
-    csv_w = csv.writer(csv_f)
-    if os.stat(csv_path).st_size == 0:
-        csv_w.writerow(["step","loss","loss_mse","loss_stft"])
-    writer = SummaryWriter(args.out_dir) if args.log_tb else None
+    model = model.to(device)
+    opt = torch.optim.AdamW(model.parameters(), lr=args.lr)
+    ema = EMA(model, beta=0.999)
 
     start_step = 0
-    if args.resume is not None and os.path.isfile(args.resume):
-        ckpt = torch.load(args.resume, map_location="cpu")
-        diff.load_state_dict(ckpt["diff"])
-        opt.load_state_dict(ckpt["opt"])
-        ema.shadow = ckpt["ema"]
-        start_step = ckpt["step"]
-        print(f"Resumed from {args.resume} at step {start_step}")
+    if args.resume:
+        start_step, _ = load_ckpt(args.resume, model, opt, ema)
 
-    scaler = torch.cuda.amp.GradScaler(enabled=(device=="cuda"))  # CUDA scaler; MPS uses autocast without scaler
+    scaler = torch.cuda.amp.GradScaler(enabled=torch.cuda.is_available())
+    use_mps = (device.type == "mps")
+    amp_enabled = use_mps or torch.cuda.is_available()
 
-    step = start_step
-    net.train()
-    while step < args.steps:
-        for x, cd in loader:
-            step += 1
+    train_iter = iter(train_loader)
+    with open(csv_path, "a", newline="") as cf:
+        cw = csv.writer(cf)
+        if start_step == 0:
+            cw.writerow(["step","loss","mse","stft"])
+        for step in tqdm(range(start_step, args.steps), total=args.steps-start_step, desc="Train"):
+            try:
+                batch = next(train_iter)
+            except StopIteration:
+                train_iter = iter(train_loader)
+                batch = next(train_iter)
+            x, cond = batch
             x = x.to(device)
-            # normalize cond shapes
-            cond = {
-                "artifact": cd["artifact"].to(device),
-                "intensity": cd["intensity"].to(device).view(-1,1),
-                "seizure": cd["seizure"].to(device).view(-1,1),
-                "age_bin": cd["age_bin"].to(device),
-                "montage_id": cd["montage_id"].to(device),
-            }
+            cond = cond.to(device)
+
+            t = torch.randint(0, model.timesteps, (x.size(0),), device=device, dtype=torch.long)
+            with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=amp_enabled):
+                loss, parts = model(x, cond, t)
 
             opt.zero_grad(set_to_none=True)
-            ctx = autocast_maybe(device, enabled=(device in ["cuda","mps"]))
-            with ctx:
-                loss, logs = diff(x, cond)
-            if device == "cuda":
+            if amp_enabled and device.type == "cuda":
                 scaler.scale(loss).backward()
                 scaler.step(opt)
                 scaler.update()
             else:
                 loss.backward()
                 opt.step()
-            ema.update(diff)
 
-            # Logging
+            ema.update(model)
+
             if step % 50 == 0:
-                csv_w.writerow([step, float(loss.detach().cpu()), float(logs["loss_mse"]), float(logs["loss_stft"])])
-                csv_f.flush()
-                if writer:
-                    writer.add_scalar("train/loss", float(loss.detach().cpu()), global_step=step)
-                    writer.add_scalar("train/loss_mse", float(logs["loss_mse"]), global_step=step)
-                    writer.add_scalar("train/loss_stft", float(logs["loss_stft"]), global_step=step)
+                row = [step, float(loss.item()), parts.get("mse", float("nan")), parts.get("stft", float("nan"))]
+                cw.writerow(row)
+                cf.flush()
+                if tb:
+                    tb.add_scalar("loss/total", loss.item(), step)
+                    for k,v in parts.items():
+                        tb.add_scalar(f"loss/{k}", v, step)
 
-            if step % args.ckpt_every == 0 or step == args.steps:
-                ck = {
-                    "diff": diff.state_dict(),
-                    "opt": opt.state_dict(),
-                    "ema": ema.shadow,
-                    "step": step
-                }
-                p = os.path.join(args.out_dir, f"ckpt_{step}.pt")
-                torch.save(ck, p)
-                print(f"[CKPT] Saved {p}")
+            if (step > 0) and (step % args.ckpt_every == 0):
+                ckpt_path = os.path.join(args.log_dir, f"checkpoints/step_{step:06d}.pt")
+                os.makedirs(os.path.dirname(ckpt_path), exist_ok=True)
+                save_ckpt(ckpt_path, model, opt, ema, step, args)
+                # EMA checkpoint
+                tmp = [p.detach().clone() for p in model.parameters()]
+                ema.copy_to(model)
+                ckpt_path_ema = os.path.join(args.log_dir, f"checkpoints/step_{step:06d}_ema.pt")
+                save_ckpt(ckpt_path_ema, model, opt, ema, step, args)
+                # restore params
+                for p, tparam in zip(model.parameters(), tmp):
+                    p.data.copy_(tparam)
 
-            if step >= args.steps:
-                break
-
-    csv_f.close()
-    if writer:
-        writer.flush(); writer.close()
+    if tb:
+        tb.close()
 
 if __name__ == "__main__":
     main()

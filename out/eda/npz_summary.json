@@ -1,12 +1,24 @@
 {
-  "counts": {
-    "none": 35,
-    "eye": 36,
-    "muscle": 39,
-    "chewing": 42,
-    "shiver": 37,
-    "electrode": 30,
-    "movement": 37
+  "n_windows": 179567,
+  "artifact_counts": {
+    "none": 89796,
+    "eye": 25210,
+    "muscle": 38262,
+    "chewing": 2374,
+    "shiver": 151,
+    "electrode": 23774,
+    "movement": 0
   },
-  "N": 256
+  "intensity_hist": [
+    89782,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    89785
+  ]
 }
