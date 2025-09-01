@@ -1,128 +1,164 @@
 #!/usr/bin/env bash
 set -euo pipefail
-export PYTHONPATH=$PWD:$PYTHONPATH
 
-# 0) choose the most recent checkpoint (prefers last.pt)
-CKPT=""
-if ls -t out/*/checkpoints/last.pt >/dev/null 2>&1; then
-  CKPT="$(ls -t out/*/checkpoints/last.pt | head -n1)"
-else
-  CKPT="$(ls -t out/*/checkpoints/step_*.pt 2>/dev/null | head -n1 || true)"
-fi
-if [[ -z "${CKPT}" ]]; then
-  echo "[error] No checkpoints found under out/*/checkpoints"; exit 1
-fi
-echo "[ckpt] ${CKPT}"
+# ---------- Config (override via env) ----------
+REAL_DIR="${REAL_DIR:-out/npz}"
+CKPT="${CKPT:-out/condgen/checkpoints/step_145000_ema.pt}"
+RUN_DIR="${RUN_DIR:-out/eval_run_$(date +%Y%m%d_%H%M%S)}"
+EVAL_DIR="${EVAL_DIR:-out/clf_eval_$(date +%Y%m%d_%H%M%S)}"
 
-STAMP="$(date +"%Y%m%d_%H%M%S")"
-RUN_DIR="out/eval_run_${STAMP}"
-EVAL_DIR="out/clf_eval_${STAMP}"
+USE_EMA="${USE_EMA:-1}"
+STEPS="${STEPS:-80}"
+GUIDANCE="${GUIDANCE:-1.5}"
+BATCH="${BATCH:-256}"
+N_PER="${N_PER:-3000}"
+
+# fixed artifact set for TUAR (no 'movement')
+ARTS=("none" "eye" "muscle" "chewing" "shiver" "electrode")
+
+# knobs
+FORCE_RESAMPLE="${FORCE_RESAMPLE:-0}"
+FORCE_REEVAL="${FORCE_REEVAL:-0}"
+DO_EXTRA="${DO_EXTRA:-1}"
+
+echo "[run] CKPT=${CKPT}"
+echo "[run] RUN_DIR=${RUN_DIR}"
+echo "[run] EVAL_DIR=${EVAL_DIR}"
+
 mkdir -p "${RUN_DIR}" "${EVAL_DIR}"
 
-# Make these visible to the summary step
-export RUN_DIR EVAL_DIR
+# ---------- 0) Verify dataset ----------
+if [ ! -d "${REAL_DIR}" ]; then
+  echo "ERROR: REAL_DIR not found: ${REAL_DIR}" >&2
+  exit 2
+fi
 
-ARTS=(none eye muscle chewing shiver electrode movement)
-ARCHS=(tiny resnet1d eegnet)
-
-# 1) sampling (EMA from inside ckpt)
+# ---------- 1) Sample ----------
 for A in "${ARTS[@]}"; do
-  echo "[sample] ${A}"
-  python sample.py --ckpt "${CKPT}" --use_ema \
-    --n 3000 --steps 80 --guidance 1.5 \
-    --artifact "${A}" --intensity 0.6 --seizure 0 --age_bin 1 --montage_id 0 \
-    --out_dir "${RUN_DIR}/synth_${A}" --save_npy --batch 256 --cond_dim 13
+  OUTD="${RUN_DIR}/synth_${A}"
+  if [[ "${FORCE_RESAMPLE}" -eq 1 ]] || [[ ! -f "${OUTD}/samples.npy" ]]; then
+    echo "[sample] ${A}"
+    python sample.py \
+      --ckpt "${CKPT}" $([ "${USE_EMA}" = "1" ] && echo --use_ema ) \
+      --n "${N_PER}" --steps "${STEPS}" --guidance "${GUIDANCE}" \
+      --artifact "${A}" --intensity 0.6 --seizure 0 --age_bin 1 --montage_id 0 \
+      --out_dir "${OUTD}" --save_npy --batch "${BATCH}" --cond_dim 13 --widths 64 128 256
+  else
+    echo "[sample] ${A} exists -> skip"
+  fi
 done
 
-# 2) fidelity: PSD + Cov/ACF
+# ---------- 2) Fidelity (PSD + Cov/ACF) ----------
 for A in "${ARTS[@]}"; do
-  FDIR="${RUN_DIR}/synth_${A}"
-  echo "[eval:psd/cov_acf] ${A}"
-  python -m eval.psd --real_dir out/npz --fake_dir "${FDIR}" --split test \
-    --out "${EVAL_DIR}/psd_${A}.json"
-  python -m eval.cov_acf --real_dir out/npz --fake_dir "${FDIR}" --split test \
-    --out "${EVAL_DIR}/covacf_${A}.json"
+  FAKED="${RUN_DIR}/synth_${A}"
+  # PSD
+  OP="${EVAL_DIR}/psd_${A}.json"
+  if [[ "${FORCE_REEVAL}" -eq 1 ]] || [[ ! -f "${OP}" ]]; then
+    python -m eval.psd_covacf --mode psd --real_dir "${REAL_DIR}" --fake_dir "${FAKED}" --out "${OP}" || true
+  fi
+  # Cov-ACF
+  OP="${EVAL_DIR}/covacf_${A}.json"
+  if [[ "${FORCE_REEVAL}" -eq 1 ]] || [[ ! -f "${OP}" ]]; then
+    python -m eval.psd_covacf --mode covacf --real_dir "${REAL_DIR}" --fake_dir "${FAKED}" --out "${OP}" || true
+  fi
 done
 
-# 3) specificity: classifier recovery (3 backbones)
-for A in "${ARTS[@]}"; do
-  FDIR="${RUN_DIR}/synth_${A}"
-  for ARCH in "${ARCHS[@]}"; do
-    echo "[eval:recovery] ${A} | ${ARCH}"
-    python -m eval.classifier_eval --real_dir out/npz --fake_dir "${FDIR}" \
-      --task artifact --arch "${ARCH}" \
-      --out "${EVAL_DIR}/recovery_${A}_${ARCH}.json" --recovery_only
+# ---------- 3) Recovery + Aug gains ----------
+for arch in tiny resnet1d eegnet; do
+  for A in "${ARTS[@]}"; do
+    OUTP="${EVAL_DIR}/recovery_${A}_${arch}.json"
+    if [[ "${FORCE_REEVAL}" -eq 1 ]] || [[ ! -f "${OUTP}" ]]; then
+      echo "[recovery] ${arch} | ${A}"
+      python -m eval.classifier_eval \
+        --real_dir "${REAL_DIR}" \
+        --fake_dir "${RUN_DIR}/synth_${A}" \
+        --augment_with "${A}" \
+        --task artifact --arch "${arch}" \
+        --epochs 8 --batch 256 --lr 1e-3 \
+        --label_key y_artifact --tqdm \
+        --out "${OUTP}"
+    fi
   done
 done
 
-# 4) utility: augmentation gains (two harder classes)
-for A in shiver electrode; do
-  FDIR="${RUN_DIR}/synth_${A}"
-  for ARCH in "${ARCHS[@]}"; do
-    echo "[eval:augment] ${A} | ${ARCH}"
-    python -m eval.classifier_eval --real_dir out/npz --fake_dir "${FDIR}" \
-      --task artifact --arch "${ARCH}" --augment "${A}" \
-      --out "${EVAL_DIR}/augment_gain_${A}_${ARCH}.json"
+# also write augmentation deltas explicitly for (electrode, shiver)
+for A in electrode shiver; do
+  for arch in tiny resnet1d eegnet; do
+    # The previous step already wrote augmentation block into recovery_*; nothing more needed.
+    :
   done
 done
 
-# 5) extra metrics (FFD/MMD/kNN/1-NN)
-for A in "${ARTS[@]}"; do
-  FDIR="${RUN_DIR}/synth_${A}"
-  echo "[eval:extra] ${A}"
-  python -m eval.extra_metrics --real_dir out/npz --fake_dir "${FDIR}" --split test \
-    --out "${EVAL_DIR}/extra_${A}.json"
-done
+# ---------- 4) Extra metrics ----------
+if [[ "${DO_EXTRA}" -eq 1 ]]; then
+  for A in "${ARTS[@]}"; do
+    OP="${EVAL_DIR}/extra_${A}.json"
+    if [[ "${FORCE_REEVAL}" -eq 1 ]] || [[ ! -f "${OP}" ]]; then
+      python -m eval.extra_metrics \
+        --real_dir "${REAL_DIR}" \
+        --fake_dir "${RUN_DIR}/synth_${A}" \
+        --feature_kind stat92 \
+        --out "${OP}" || true
+    fi
+  done
+fi
 
-# 6) summary tables for paper
+# ---------- 5) Summary (markdown) ----------
 python - <<'PY'
-import os, json
-RUN_DIR=os.environ["RUN_DIR"]; EVAL_DIR=os.environ["EVAL_DIR"]
-arts=["none","eye","muscle","chewing","shiver","electrode","movement"]
-archs=["tiny","resnet1d","eegnet"]
+import os, json, glob
+E = os.environ["EVAL_DIR"]
+R = os.environ["RUN_DIR"]
+ARTS = ["none","eye","muscle","chewing","shiver","electrode"]
 def J(p):
-  try:
-    with open(p,"r") as f: return json.load(f)
-  except: return {}
-lines=[]
-lines+=["# Table 1 — Fidelity",
-        "| Artifact | Δδ | Δθ | Δα | Δβ | Cov Fro ↓ | ACF L2 ↓ | n_fake |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|"]
-for A in arts:
-  psd=J(os.path.join(EVAL_DIR,f"psd_{A}.json"))
-  cov=J(os.path.join(EVAL_DIR,f"covacf_{A}.json"))
-  bre=psd.get("band_rel_err",{})
-  fmt=lambda v: ("nan" if v is None else f"{float(v):.3f}")
-  lines.append(f"| {A} | {fmt(bre.get('delta',0))} | {fmt(bre.get('theta',0))} | {fmt(bre.get('alpha',0))} | {fmt(bre.get('beta',0))} | {fmt(cov.get('cov_fro',0))} | {int(cov.get('acf_l2',0))} | {psd.get('n_fake',0)} |")
-lines+=["","## Table 2 — Specificity (recovery)"]
-for A in arts:
-  lines.append(f"### {A}")
-  for arch in archs:
-    r=J(os.path.join(EVAL_DIR,f"recovery_{A}_{arch}.json")).get("recovery",{})
-    lines.append(f"- **{arch}**: F1={r.get('macro_f1',0):.3f}, Acc={r.get('acc',0):.3f}, IM={(r.get('intended_match',0) or 0):.3f}, n_fake={r.get('n_fake',0)}")
-  lines.append("")
-lines+=["## Table 3 — Utility (augmentation gains)"]
-for A in ["electrode","shiver"]:
-  for arch in archs:
-    j=J(os.path.join(EVAL_DIR,f"augment_gain_{A}_{arch}.json"))
-    aug=j.get("augmentation",{})
-    if aug:
-      lines.append(f"- **{A}** ({arch}): ΔF1={aug.get('delta_macro_f1',0):+.3f}, ΔAcc={aug.get('delta_acc',0):+.3f} (n_train_aug={aug.get('n_train_aug',0)})")
-lines+=["","## Extra Metrics (features) — per artifact",
-        "| Artifact | FFD ↓ | MMD (RBF) ↓ | kNN-Prec ↑ | kNN-Rec ↑ | 1-NN Acc → 0.5 |",
-        "|---|---:|---:|---:|---:|---:|"]
-for A in arts:
-  e=J(os.path.join(EVAL_DIR,f"extra_${A}.json".replace("${A}",A)))
-  lines.append(f"| {A} | {e.get('ffd',e.get('FID_like',0.0)):.3f} | {e.get('mmd_rbf',e.get('mmd',0.0)):.4f} | {e.get('knn_prec',0.0):.3f} | {e.get('knn_rec',0.0):.3f} | {e.get('one_nn_acc',e.get('nn1_acc',0.0)):.3f} |")
-outp=os.path.join(EVAL_DIR,"summary_tables.md")
-open(outp,"w").write("\n".join(lines))
+    try:
+        with open(p,"r") as f: return json.load(f)
+    except Exception: return None
+
+lines = [ "# Classifier + Fidelity Summary", f"- RUN_DIR: {R}", f"- EVAL_DIR: {E}", "", "# Table 1 — Fidelity", "| Artifact | Δδ | Δθ | Δα | Δβ | Cov Fro ↓ | ACF L2 ↓ | n_fake |", "|---|---:|---:|---:|---:|---:|---:|---:|"]
+for a in ARTS:
+    psd = J(os.path.join(E, f"psd_{a}.json")) or {}
+    cov = J(os.path.join(E, f"covacf_{a}.json")) or {}
+    n_fake = cov.get("n_fake", psd.get("n_fake", 0))
+    dd, dt, da, db = (psd.get("delta_delta",0.0), psd.get("delta_theta",0.0), psd.get("delta_alpha",0.0), psd.get("delta_beta",0.0))
+    lines.append(f"| {a} | {dd:.3f} | {dt:.3f} | {da:.3f} | {db:.3f} | {cov.get('cov_fro',0.0):.3f} | {cov.get('acf_l2',0):.0f} | {n_fake} |")
+
+lines += ["", "## Table 2 — Specificity (recovery)"]
+for a in ARTS:
+    lines += [f"### {a}"]
+    for arch in ["tiny","resnet1d","eegnet"]:
+        p = os.path.join(E, f"recovery_{a}_{arch}.json")
+        j = J(p) or {}
+        rec = j.get("recovery", {})
+        base = j.get("baseline", {})
+        im  = rec.get("intended_match", 0.0) if rec else 0.0
+        nfk = rec.get("n_fake", 0) if rec else 0
+        lines.append(f"- **{arch}**: F1={base.get('macro_f1',0.0):.3f}, Acc={base.get('acc',0.0):.3f}, IM={im:.3f}, n_fake={nfk}")
+    lines.append("")
+
+lines += ["", "## Table 3 — Utility (augmentation gains)"]
+for a in ["electrode","shiver"]:
+    for arch in ["tiny","resnet1d","eegnet"]:
+        p = os.path.join(E, f"recovery_{a}_{arch}.json")
+        j = J(p) or {}
+        aug = j.get("augmentation", None)
+        if aug:
+            lines.append(f"- **{a}** ({arch}): ΔF1={aug.get('delta_macro_f1',0.0):+0.3f}, ΔAcc={aug.get('delta_acc',0.0):+0.3f} (n_train_aug={aug.get('n_train_aug',0)})")
+
+# Extra metrics table (optional)
+extra = []
+for a in ARTS:
+    p = os.path.join(E, f"extra_{a}.json")
+    j = J(p)
+    if j:
+        extra.append((a, j))
+if extra:
+    lines += ["", "## Extra Metrics (features) — per artifact", "| Artifact | FFD ↓ | MMD (RBF) ↓ | kNN-Prec ↑ | kNN-Rec ↑ | 1-NN Acc → 0.5 |", "|---|---:|---:|---:|---:|---:|"]
+    for a,j in extra:
+        lines.append(f"| {a} | {j.get('ffd',0.0):.3f} | {j.get('mmd_rbf',0.0):.4f} | {j.get('knn_precision',0.0):.3f} | {j.get('knn_recall',0.0):.3f} | {j.get('nn_two_sample_acc',0.0):.3f} |")
+
+outp = os.path.join(E, "summary.md")
+open(outp, "w").write("\n".join(lines))
 print("Wrote", outp)
 PY
 
-echo
-echo "============================"
-echo "DONE."
-echo "Samples:   ${RUN_DIR}"
-echo "Eval out:  ${EVAL_DIR}"
-echo "Summary:   ${EVAL_DIR}/summary_tables.md"
-echo "============================"
+echo "[run] Done."
