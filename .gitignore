@@ -1,2 +1,4 @@
 venv/
 out/npz*
+out/clf_eval*
+out/eval_run*
