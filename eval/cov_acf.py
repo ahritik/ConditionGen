@@ -44,10 +44,19 @@ def mean_covariance(X: np.ndarray) -> np.ndarray:
 
 def acf(x: np.ndarray, nlags=150) -> np.ndarray:
     x = x - x.mean()
-    ac = np.correlate(x, x, mode="full")[len(x)-1 : len(x)+nlags-1]
-    ac /= (np.arange(len(ac))[::-1] + 1e-6)
-    ac /= ac[0] + 1e-8
-    return ac
+    var = float(np.var(x))
+    if var < 1e-8:  # nearly flat—return zeros to avoid divide-by-tiny
+        return np.zeros((nlags,), np.float32)
+
+    # unbiased autocov (divide by N-lag), then normalize by acov[0]
+    N = len(x)
+    ac = np.correlate(x, x, mode="full")[N-1 : N+nlags-1]
+    ac = ac / (N - np.arange(nlags))
+    ac0 = ac[0]
+    if ac0 <= 1e-8:
+        return np.zeros((nlags,), np.float32)
+    return (ac / ac0).astype(np.float32)
+
 
 def mean_acf_first_channel(X: np.ndarray, nlags=150) -> np.ndarray:
     if X.shape[0] == 0: return np.zeros((nlags,), np.float32)

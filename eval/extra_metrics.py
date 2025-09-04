@@ -68,8 +68,9 @@ def _infer_artifact_from_dir(fake_dir: str):
         except Exception:
             pass
     name = os.path.basename(os.path.normpath(fake_dir)).lower()
+    segs = re.split(r'[^a-z0-9]+', name)  # split on non-alphanumerics: _, -, .
     for a in ARTIFACT_SET:
-        if re.search(rf"\b{re.escape(a)}\b", name):
+        if a in segs:
             return a
     return "unknown"
 
