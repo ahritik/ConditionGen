@@ -15,7 +15,7 @@ try:
     from utils.constants import BANDS as _BANDS, ARTIFACT_SET
 except Exception:
     _BANDS = {"delta":(0.5,4), "theta":(4,8), "alpha":(8,13), "beta":(13,30)}
-    ARTIFACT_SET = ["none","eye","muscle","chewing","shiver","electrode","movement"]
+    ARTIFACT_SET = ["none","eye","muscle","chewing","shiver","electrode"]
 
 # ---------------- IO ----------------
 
@@ -138,10 +138,10 @@ class BasicBlock1D(nn.Module):
         return torch.relu(y + s)
 
 class ResNet1DTiny(nn.Module):
-    def __init__(self, c_in=8, n_classes=7, widths=(32,64,128)):
+    def __init__(self, c_in=8, n_classes=6, widths=(32,64,128)):
         super().__init__()
         self.stem = nn.Sequential(
-            nn.Conv1d(c_in, widths[0], 7, padding=3, bias=False),
+            nn.Conv1d(c_in, widths[0], 6, padding=3, bias=False),
             nn.BatchNorm1d(widths[0]),
             nn.ReLU(inplace=True),
         )

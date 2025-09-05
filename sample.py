@@ -1,212 +1,123 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Robust sampler for ConditionGen.
-- Works with base (EMA) and fine-tuned (no-EMA) checkpoints
-- Handles different UNet1DFiLM constructor arg names (c_in / channels / in_ch)
-- Uses Diffusion.ddim_sample with correct kwargs (cond=(B,cond_dim), guidance, shape=(C,T))
-- Chunked sampling with tqdm
+sample.py
+---------
+Sampler that matches the 6-class TUAR taxonomy (no movement).
+
+- Loads class order from the training label_map.json next to the checkpoint.
+- Builds the same 12-D conditioning vector as training (no intensity).
+- Works with classifier-free guidance and DDIM/Heun samplers.
 """
 
-import os, json, argparse, time, inspect
-from pathlib import Path
-
+from __future__ import annotations
+import os, json, argparse
 import numpy as np
-import torch
 from tqdm import tqdm
 
-# ----------------- imports -----------------
-def _try_import():
-    try:
-        from models.unet1d_film import UNet1DFiLM
-        from models.diffusion import Diffusion
-        return UNet1DFiLM, Diffusion
-    except Exception:
-        from unet1d_film import UNet1DFiLM  # type: ignore
-        from diffusion import Diffusion      # type: ignore
-        return UNet1DFiLM, Diffusion
+import torch
+torch.set_float32_matmul_precision("high")
 
-UNet1DFiLM, Diffusion = _try_import()
+# Robust imports (with or without a 'models' package)
+try:
+    from models.unet1d_film import UNet1DFiLM
+    from models.diffusion import Diffusion
+except ImportError:
+    from unet1d_film import UNet1DFiLM
+    from diffusion import Diffusion
 
-ARTIFACT_SET = ["none","eye","muscle","chewing","shiver","electrode","movement"]
-ART2IDX = {a:i for i,a in enumerate(ARTIFACT_SET)}
-C, T = 8, 800  # EEG shape
+from conditioning import load_label_map_from, build_cond_torch, ARTIFACTS_CANON
 
-# --------------- condition builder (13 dims) ---------------
-def build_cond_vec(artifact:str, intensity:float, seizure:int, age_bin:int, montage_id:int) -> torch.Tensor:
-    """
-    Layout (matches training):
-      [ one-hot artifact (7) | intensity (1) | age (4 one-hot) | montage_id (1 scalar) ]  = 13
-    """
-    if artifact not in ART2IDX:
-        raise ValueError(f"Unknown artifact: {artifact}. Choices: {ARTIFACT_SET}")
-    a = torch.zeros(len(ARTIFACT_SET), dtype=torch.float32)
-    a[ART2IDX[artifact]] = 1.0
+def pick_device():
+    if torch.cuda.is_available(): return torch.device("cuda"), "cuda"
+    if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available(): return torch.device("mps"), "mps"
+    return torch.device("cpu"), "cpu"
 
-    inten = torch.tensor([float(intensity)], dtype=torch.float32)
+def load_ckpt(ckpt_path: str, model: torch.nn.Module):
+    ckpt = torch.load(ckpt_path, map_location="cpu")
+    state = ckpt.get("ema", ckpt.get("model", ckpt))
+    if isinstance(state, dict) and "model" in state and "ema_model" in state["model"]:
+        state = state["model"]
+    model.load_state_dict(state if isinstance(state, dict) else ckpt["model"], strict=False)
+    return ckpt.get("step", None)
 
-    age = torch.zeros(4, dtype=torch.float32)
-    age_idx = max(0, min(3, int(age_bin)))
-    age[age_idx] = 1.0
-
-    mont = torch.tensor([float(montage_id)], dtype=torch.float32)  # scalar feature (not one-hot)
-
-    return torch.cat([a, inten, age, mont], dim=0)  # (13,)
-
-# --------------- builders ----------------
-def make_unet(c_in:int, widths:tuple, cond_dim:int, device:torch.device):
-    sig = inspect.signature(UNet1DFiLM.__init__)
-    arg_names = list(sig.parameters.keys())
-    kwargs = {}
-    for k in ("c_in","channels","in_ch","in_channels"):
-        if k in arg_names:
-            kwargs[k] = c_in
-            break
-    for k in ("c_hidden","widths","ch_mult","base_channels"):
-        if k in arg_names:
-            kwargs[k] = tuple(widths)
-            break
-    if "cond_dim" in arg_names:
-        kwargs["cond_dim"] = cond_dim
-    return UNet1DFiLM(**kwargs).to(device)
-
-def make_diffusion(net, T:int, device:torch.device):
-    return Diffusion(net, T=T).to(device)
-
-# --------------- ckpt loader ---------------
-def _is_diffusion_state(sd:dict)->bool:
-    if not isinstance(sd, dict): return False
-    for k in sd.keys():
-        if k in ("betas","alphas_cumprod","alphas_cumprod_prev","sqrt_alphas_cumprod","sqrt_one_minus_alphas_cumprod","c0","c1"):
-            return True
-        if isinstance(k, str) and k.startswith("model."):
-            return True
-    return False
-
-def load_ckpt_into_diffuser(diffuser:Diffusion, ckpt_path:str, use_ema:bool=True)->tuple[int, list, list]:
-    sd = torch.load(ckpt_path, map_location="cpu")
-    step = int(sd.get("step", 0)) if isinstance(sd, dict) else 0
-
-    cand = None
-    if isinstance(sd, dict):
-        if use_ema and ("ema" in sd and isinstance(sd["ema"], dict)):
-            cand = sd["ema"]
-        elif "model" in sd and isinstance(sd["model"], dict):
-            cand = sd["model"]
-        elif "state_dict" in sd and isinstance(sd["state_dict"], dict):
-            cand = sd["state_dict"]
-        elif _is_diffusion_state(sd):
-            cand = sd
-    if cand is None:
-        cand = sd
-
-    needs_prefix = isinstance(cand, dict) and cand and all(isinstance(k,str) and not k.startswith("model.") for k in cand.keys())
-    if needs_prefix and any(isinstance(k,str) and "." in k for k in cand.keys()):
-        cand = {f"model.{k}": v for k,v in cand.items()}
-
-    missing, unexpected = diffuser.load_state_dict(cand, strict=False)
-    return step, missing, unexpected
-
-# --------------- sampling (chunked + batched cond) ---------------
-@torch.no_grad()
-def sample_all(diffuser:Diffusion, cond_base:torch.Tensor, n:int, steps:int, guidance:float, chunk:int,
-               device:torch.device)->np.ndarray:
-    """
-    Calls diffusion.ddim_sample repeatedly in chunks.
-    Ensures cond has shape (B,cond_dim) for FiLM (was the crash).
-    """
-    cond_base = cond_base.to(device).float()  # (13,)
-    out = []
-    pbar = tqdm(total=n, desc="Sampling", unit="sig")
-    done = 0
-    while done < n:
-        bs = min(chunk, n - done)
-        cond = cond_base.unsqueeze(0).repeat(bs, 1)  # (bs, cond_dim) <-- critical fix
-        x = diffuser.ddim_sample(n=bs, cond=cond, steps=steps, guidance=guidance,
-                                 shape=(C, T), device=device)
-        out.append(x.detach().cpu().numpy())
-        done += bs
-        pbar.update(bs)
-    pbar.close()
-    return np.concatenate(out, axis=0)  # (n, C, T)
-
-# --------------- main ----------------
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--ckpt", required=True, type=str, help="Path to checkpoint (ema or last)")
-    ap.add_argument("--use_ema", action="store_true", help="Load EMA weights if available")
-    ap.add_argument("--artifact", type=str, default="none", choices=ARTIFACT_SET)
-    ap.add_argument("--intensity", type=float, default=0.6)
-    ap.add_argument("--seizure", type=int, default=0)  # kept for compat
+    ap.add_argument("--ckpt", required=True, help="path to training checkpoint (.pt)")
+    ap.add_argument("--artifact", required=True, type=str, help="artifact name (must be in label_map.json)")
+    ap.add_argument("--n", type=int, default=1024)
+    ap.add_argument("--steps", type=int, default=80)
+    ap.add_argument("--guidance", type=float, default=0.0)
+    ap.add_argument("--eta", type=float, default=0.0)
+    ap.add_argument("--batch", type=int, default=256)
+    ap.add_argument("--shape", type=int, nargs=2, default=[8, 800], help="C T")
+    ap.add_argument("--seizure", type=int, default=0)
     ap.add_argument("--age_bin", type=int, default=1)
     ap.add_argument("--montage_id", type=int, default=0)
-    ap.add_argument("--n", type=int, default=3000)
-    ap.add_argument("--steps", type=int, default=80)
-    ap.add_argument("--guidance", type=float, default=1.0)
-    ap.add_argument("--batch", type=int, default=256, help="chunk size for sampling")
-    ap.add_argument("--cond_dim", type=int, default=13)
-    ap.add_argument("--widths", type=int, nargs="+", default=[64,128,256])
-    ap.add_argument("--out_dir", type=str, required=True)
-    ap.add_argument("--save_npy", action="store_true")
-
+    ap.add_argument("--out_dir", required=True)
+    ap.add_argument("--save_npz", action="store_true")
+    ap.add_argument("--sampler", choices=["ddim", "heun"], default="ddim")
     args = ap.parse_args()
 
-    # device
-    if torch.cuda.is_available():
-        device = torch.device("cuda")
-    elif getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
-        device = torch.device("mps")
+    os.makedirs(args.out_dir, exist_ok=True)
+
+    # Class order (should be 6 for TUAR)
+    CLASS_NAMES = load_label_map_from(args.ckpt) or ARTIFACTS_CANON
+    NAME2IDX = {n: i for i, n in enumerate(CLASS_NAMES)}
+    n_artifacts = len(CLASS_NAMES)
+    if args.artifact not in NAME2IDX:
+        raise SystemExit(f"--artifact '{args.artifact}' not found in classes: {CLASS_NAMES}")
+
+    # Device + model
+    device, dev = pick_device()
+    C, T = int(args.shape[0]), int(args.shape[1])
+    cond_dim = n_artifacts + 6  # 6: seizure(1) + age(4) + montage(1)
+    net = UNet1DFiLM(channels=C, widths=(64, 128, 256), cond_dim=cond_dim).to(device)
+    model = Diffusion(net, T=1000).to(device)
+    step = load_ckpt(args.ckpt, model)
+    print(f"[ckpt] loaded step={step} on {dev}")
+
+    # Conditioning vector (12-D for TUAR)
+    art_idx = NAME2IDX[args.artifact]
+    cond_single = build_cond_torch(
+        artifact_idx=art_idx,
+        seizure=args.seizure,
+        age_bin=args.age_bin,
+        montage_id=args.montage_id,
+        n_artifacts=n_artifacts,
+        device=device,
+    )
+    cond = cond_single.unsqueeze(0).repeat(args.n, 1)  # [n,cond_dim]
+
+    # Sample
+    with torch.no_grad():
+        if args.sampler == "ddim":
+            x = model.ddim_sample(n=args.n, cond=cond, steps=args.steps, guidance=args.guidance,
+                                  eta=args.eta, batch=args.batch, shape=(C, T), device=device)
+        else:
+            x = model.heun_sample(n=args.n, cond=cond, steps=args.steps, guidance=args.guidance,
+                                  batch=args.batch, shape=(C, T), device=device)
+    x = x.cpu().numpy()
+
+    # Save
+    base = os.path.join(args.out_dir, f"synth_{args.artifact}")
+    if args.save_npz:
+        np.savez_compressed(base + ".npz", x=x, artifact=np.full((args.n,), art_idx, dtype=np.int32),
+                            seizure=args.seizure, age_bin=args.age_bin, montage_id=args.montage_id)
     else:
-        device = torch.device("cpu")
-    print(f"[sample] device={device.type}")
+        np.save(base + ".npy", x)
 
-    # net + diffusion
-    net = make_unet(C, tuple(args.widths), args.cond_dim, device)
-    diff = make_diffusion(net, T=1000, device=device)
-
-    # load ckpt
-    step, missing, unexpected = load_ckpt_into_diffuser(diff, args.ckpt, use_ema=args.use_ema)
-    print(f"[sample] Loaded ckpt step={step}; missing={len(missing)} unexpected={len(unexpected)}")
-    if unexpected:
-        print("[sample]   unexpected (first 8):", sorted(list(unexpected))[:8])
-    if missing:
-        print("[sample]   missing (first 8):", sorted(list(missing))[:8])
-
-    # condition
-    cond_vec = build_cond_vec(args.artifact, args.intensity, args.seizure, args.age_bin, args.montage_id)
-
-    # out dir
-    out_dir = Path(args.out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    # sample
-    t0 = time.time()
-    X = sample_all(diff, cond_vec, args.n, args.steps, args.guidance, args.batch, device)
-    dt = time.time() - t0
-    print(f"[sample] Done. Generated {len(X)} signals in {dt/60:.1f} min.")
-
-    # save
-    npy_path = out_dir / "samples.npy"
-    np.save(npy_path, X.astype(np.float32))
     meta = {
-        "ckpt": args.ckpt,
-        "use_ema": bool(args.use_ema),
-        "artifact": args.artifact,
-        "intensity": float(args.intensity),
-        "age_bin": int(args.age_bin),
-        "montage_id": int(args.montage_id),
-        "n": int(args.n),
-        "steps": int(args.steps),
-        "guidance": float(args.guidance),
-        "batch": int(args.batch),
-        "cond_dim": int(args.cond_dim),
-        "widths": list(map(int, args.widths)),
-        "device": device.type,
-        "step_ckpt": int(step),
-        "shape": [C,T],
+        "ckpt": args.ckpt, "step": int(step) if step is not None else None,
+        "class_names": CLASS_NAMES, "artifact": args.artifact, "artifact_idx": int(art_idx),
+        "n": int(args.n), "steps": int(args.steps), "guidance": float(args.guidance),
+        "eta": float(args.eta), "batch": int(args.batch), "shape": [C, T],
+        "seizure": int(args.seizure), "age_bin": int(args.age_bin), "montage_id": int(args.montage_id),
+        "sampler": args.sampler,
     }
-    json.dump(meta, open(out_dir/"meta.json","w"), indent=2)
-    print(f"[sample] Wrote {npy_path} and meta.json")
+    with open(base + ".json", "w") as f:
+        json.dump(meta, f, indent=2)
+    print(f"[write] {base}.(npy|npz) and {base}.json")
 
 if __name__ == "__main__":
     main()

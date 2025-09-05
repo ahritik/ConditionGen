@@ -1,397 +1,218 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Classifier evaluation on TUAR-style NPZ shards (6 classes, no 'movement').
+classifier_eval.py
+------------------
+6-class TUAR recovery/augmentation evaluator (no movement).
 
-Modes
------
-1) Baseline: train on real train/val; report metrics on real test.
-2) Recovery: baseline + predict on fakes in --fake_dir; report intended_match and counts.
-3) Augmentation: baseline + re-train with fakes labeled as --augment_artifact; report deltas.
-
-Examples
---------
-# Recovery (predict intended artifact on fakes)
-python -m eval.classifier_eval \
-  --real_dir out/npz \
-  --fake_dir out/eval_run_XXXX/synth_eye \
-  --augment_artifact eye \
-  --task artifact --arch resnet1d \
-  --epochs 8 --batch 256 --lr 1e-3 \
-  --out out/clf_eval/recovery_eye_resnet1d.json
-
-# Augmentation (train+synthetic, re-train)
-python -m eval.classifier_eval \
-  --real_dir out/npz \
-  --fake_dir out/eval_run_XXXX/synth_electrode \
-  --augment_artifact electrode \
-  --task artifact --arch eegnet \
-  --epochs 8 --batch 256 --lr 1e-3 \
-  --out out/clf_eval/augment_gain_electrode_eegnet.json
+- Trains a small 1D CNN on real shards (class order from label_map.json).
+- Reports baseline metrics on real test.
+- Optionally evaluates fakes in --fake_dir and computes Intended-Match (IM).
 """
 
-import argparse, json, os
-from pathlib import Path
-import random
+from __future__ import annotations
+import os, json, glob, argparse, random
+from typing import List, Dict
+
 import numpy as np
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from sklearn.metrics import f1_score, confusion_matrix, accuracy_score
 from tqdm import tqdm
 
-# ---------------------------------------------------------------------
-# Final 6-class taxonomy (movement REMOVED completely)
-ARTIFACT_SET = ["none", "eye", "muscle", "chewing", "shiver", "electrode"]
-NAME2IDX = {n: i for i, n in enumerate(ARTIFACT_SET)}
-IDX2NAME = {i: n for n, i in NAME2IDX.items()}
-NUM_CLASSES = len(ARTIFACT_SET)  # 6
-# ---------------------------------------------------------------------
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
 
+from conditioning import load_label_map_from, ARTIFACTS_CANON
 
-# -------------------- utils --------------------
-def set_seed(s=1337):
-    random.seed(s); np.random.seed(s); torch.manual_seed(s)
-    if torch.cuda.is_available(): torch.cuda.manual_seed_all(s)
+# ------------------------------ Data -----------------------------------------
 
-
-def device_pick():
-    if torch.backends.mps.is_available(): return torch.device("mps")
-    if torch.cuda.is_available(): return torch.device("cuda")
-    return torch.device("cpu")
-
-
-def _concat_until_limit(xs, ys, limit):
-    X = np.concatenate(xs, axis=0)
-    y = np.concatenate(ys, axis=0)
-    if limit is not None and X.shape[0] > limit:
-        X = X[:limit]; y = y[:limit]
-    return X, y
-
-
-def _filter_to_6_classes(X, y):
-    """Keep only labels in {0..5}. Drop anything else (e.g., old 'movement'=6)."""
-    keep = (y >= 0) & (y < NUM_CLASSES)
-    if keep.sum() != y.shape[0]:
-        dropped = int(y.shape[0] - keep.sum())
-        print(f"[filter] dropping {dropped} samples outside 6-class set")
-    return X[keep], y[keep]
-
-
-def load_npz_split(root, split, limit=None, label_key="y_artifact"):
-    """
-    Load TUAR shards: keys: x, y_artifact (preferred) or artifact or y.
-    Returns X:(N,C,T) float32; y:(N,) int64. Filters to 6 classes.
-    """
-    root = Path(root)
-    files = sorted(root.glob(f"{split}_*.npz"))
-    if not files:
-        raise FileNotFoundError(f"No shards found at {root}/{split}_*.npz")
-    xs, ys = [], []
-    for fp in files:
-        d = np.load(fp)
-        x = d["x"]  # (N,C,T)
-        # label resolution
-        if label_key in d:
-            y = d[label_key].astype(np.int64)
-        elif "artifact" in d:
-            y = d["artifact"].astype(np.int64)
-        elif "y" in d:
-            y = d["y"].astype(np.int64)
-        else:
-            raise KeyError(f"No labels found in {fp} (looked for {label_key}, artifact, y)")
-        xs.append(x); ys.append(y)
-        if limit is not None and sum(t.shape[0] for t in xs) >= limit:
-            break
-    X, y = _concat_until_limit(xs, ys, limit)
-    X, y = _filter_to_6_classes(X, y)
-    X = X.astype(np.float32)
-    return X, y
-
-
-def load_fake_dir(fake_dir):
-    """Load generated samples from synth folder (prefers samples.npy)."""
-    cand = ["samples.npy", "samples_post.npy", "x.npy"]
-    for c in cand:
-        p = Path(fake_dir) / c
-        if p.exists():
-            x = np.load(p, mmap_mode=None).astype(np.float32)
-            if x.ndim != 3:
-                raise ValueError(f"Fake array must be (N,C,T), got shape {x.shape} in {p}")
-            return x
-    raise FileNotFoundError(f"No fake array found in {fake_dir} (looked for {cand})")
-
-
-def hist(y):
-    h = {IDX2NAME[i]: int((y == i).sum()) for i in range(NUM_CLASSES)}
-    h["total"] = int(y.shape[0])
-    return h
-
-
-# -------------------- simple models --------------------
-class Tiny1D(nn.Module):
-    def __init__(self, in_ch=8, ncls=NUM_CLASSES):
+class NPZClassifierDS(Dataset):
+    def __init__(self, root: str, class_names: List[str], shuffle_files: bool = True):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv1d(in_ch, 64, 7, padding=3), nn.ReLU(),
-            nn.Conv1d(64, 128, 5, padding=2), nn.ReLU(),
-            nn.Conv1d(128, 128, 5, padding=2), nn.ReLU(),
-            nn.AdaptiveAvgPool1d(1),
-        )
-        self.fc = nn.Linear(128, ncls)
+        self.root = root
+        self.class_names = class_names
+        self.name2idx = {n: i for i, n in enumerate(class_names)}
+        self.files = sorted(glob.glob(os.path.join(root, "*.npz")))
+        if shuffle_files: random.shuffle(self.files)
+        if not self.files: raise RuntimeError(f"No npz files in {root}")
+        self.index = []
+        for fi, fp in enumerate(self.files):
+            with np.load(fp, allow_pickle=True) as npz:
+                n = npz["x"].shape[0]
+            self.index += [(fi, i) for i in range(n)]
+
+    def __len__(self): return len(self.index)
+
+    def __getitem__(self, idx: int):
+        fi, row = self.index[idx]
+        fp = self.files[fi]
+        with np.load(fp, allow_pickle=True) as npz:
+            x = npz["x"][row].astype(np.float32)  # [C,T]
+            y = npz["artifact"][row] if "artifact" in npz else npz["y_artifact"][row]
+            if isinstance(y, (np.integer, int)):
+                y_idx = int(y)
+            else:
+                y_idx = self.name2idx[str(y)]
+        return torch.tensor(x), torch.tensor(y_idx, dtype=torch.long)
+
+def make_loader(root: str, class_names: List[str], batch: int, shuffle: bool) -> DataLoader:
+    ds = NPZClassifierDS(root, class_names, shuffle_files=shuffle)
+    def _collate(batch):
+        xs, ys = zip(*batch)
+        return torch.stack(xs, dim=0), torch.stack(ys, dim=0)
+    return DataLoader(ds, batch_size=batch, shuffle=shuffle, drop_last=False,
+                      num_workers=4, pin_memory=True, collate_fn=_collate)
+
+# ------------------------------ Model ----------------------------------------
+
+class SmallResNet1D(nn.Module):
+    def __init__(self, in_ch: int, n_cls: int):
+        super().__init__()
+        def block(cin, cout, stride=1):
+            return nn.Sequential(
+                nn.Conv1d(cin, cout, 7, stride=stride, padding=3),
+                nn.BatchNorm1d(cout),
+                nn.ReLU(inplace=True),
+                nn.Conv1d(cout, cout, 3, padding=1),
+                nn.BatchNorm1d(cout),
+                nn.ReLU(inplace=True),
+            )
+        self.stem = nn.Sequential(nn.Conv1d(in_ch, 64, 7, padding=3),
+                                  nn.BatchNorm1d(64), nn.ReLU(inplace=True))
+        self.layer1 = block(64, 128, stride=2)
+        self.layer2 = block(128, 256, stride=2)
+        self.pool = nn.AdaptiveAvgPool1d(1)
+        self.fc = nn.Linear(256, n_cls)
+
     def forward(self, x):
-        h = self.net(x).squeeze(-1)
+        h = self.stem(x)
+        h = self.layer1(h)
+        h = self.layer2(h)
+        h = self.pool(h).squeeze(-1)
         return self.fc(h)
 
-
-class ResNet1D(nn.Module):
-    def __init__(self, in_ch=8, ncls=NUM_CLASSES, width=64):
-        super().__init__()
-        self.stem = nn.Sequential(
-            nn.Conv1d(in_ch, width, 7, padding=3), nn.BatchNorm1d(width), nn.ReLU()
-        )
-        self.block1 = self._blk(width, width)
-        self.block2 = self._blk(width, width*2, stride=2)
-        self.block3 = self._blk(width*2, width*2)
-        self.pool = nn.AdaptiveAvgPool1d(1)
-        self.fc = nn.Linear(width*2, ncls)
-    def _blk(self, c1, c2, stride=1):
-        return nn.Sequential(
-            nn.Conv1d(c1, c2, 3, stride=stride, padding=1), nn.BatchNorm1d(c2), nn.ReLU(),
-            nn.Conv1d(c2, c2, 3, padding=1), nn.BatchNorm1d(c2), nn.ReLU(),
-        )
-    def forward(self, x):
-        x = self.stem(x)
-        x = self.block1(x)
-        x = self.block2(x)
-        x = self.block3(x)
-        x = self.pool(x).squeeze(-1)
-        return self.fc(x)
-
-
-class EEGNetLite(nn.Module):
-    """Compact EEGNet-ish conv stack (shape-stable for (B,C,T))."""
-    def __init__(self, in_ch=8, ncls=NUM_CLASSES):
-        super().__init__()
-        self.conv_t = nn.Conv2d(1, 8, (1, 32), padding=(0, 16))
-        self.conv_s = nn.Conv2d(8, 16, (in_ch, 1), groups=8)
-        self.dw = nn.Conv2d(16, 32, (1, 16), padding=(0, 8), groups=16)
-        self.pw = nn.Conv2d(32, 64, 1)
-        self.pool = nn.AdaptiveAvgPool2d((1, 1))
-        self.fc = nn.Linear(64, ncls)
-    def forward(self, x):
-        x = x.unsqueeze(1)             # (B,1,C,T)
-        x = F.elu(self.conv_t(x))
-        x = F.elu(self.conv_s(x))
-        x = F.elu(self.dw(x))
-        x = F.elu(self.pw(x))
-        x = self.pool(x).flatten(1)
-        return self.fc(x)
-
-
-def make_model(arch, in_ch=8, ncls=NUM_CLASSES):
-    if arch == "tiny":
-        return Tiny1D(in_ch, ncls)
-    if arch == "resnet1d":
-        return ResNet1D(in_ch, ncls)
-    if arch == "eegnet":
-        return EEGNetLite(in_ch, ncls)
-    raise ValueError(arch)
-
-
-def class_weights(y_np):
-    counts = np.bincount(y_np, minlength=NUM_CLASSES).astype(np.float64)
-    counts[counts == 0] = 1.0
-    w = 1.0 / counts
-    w = w * (NUM_CLASSES / w.sum())
-    return torch.tensor(w, dtype=torch.float32)
-
+# ------------------------------ Metrics --------------------------------------
 
 @torch.no_grad()
-def evaluate(model, X, y, device, bs=512):
+def eval_classifier(model: nn.Module, loader: DataLoader, device: torch.device) -> Dict[str, float]:
     model.eval()
-    preds = []
-    for i in range(0, X.shape[0], bs):
-        xb = torch.from_numpy(X[i:i+bs]).to(device)
-        logits = model(xb)
-        preds.append(logits.argmax(1).cpu().numpy())
-    yhat = np.concatenate(preds, axis=0)
-    acc = accuracy_score(y, yhat)
-    cm = confusion_matrix(y, yhat, labels=list(range(NUM_CLASSES)))
-    f1_macro = f1_score(y, yhat, average="macro", labels=list(range(NUM_CLASSES)), zero_division=0)
+    n_correct = 0; n_total = 0
+    from collections import defaultdict
+    tp = defaultdict(int); fp = defaultdict(int); fn = defaultdict(int)
 
-    per_f1 = {}
-    for k in range(NUM_CLASSES):
-        per_f1[IDX2NAME[k]] = float(
-            f1_score((y == k).astype(int), (yhat == k).astype(int), zero_division=0)
-        )
+    for x, y in loader:
+        x = x.to(device); y = y.to(device)
+        pred = model(x).argmax(dim=1)
+        n_correct += (pred == y).sum().item()
+        n_total += y.numel()
+        for t, p in zip(y.view(-1).tolist(), pred.view(-1).tolist()):
+            if p == t: tp[t] += 1
+            else: fp[p] += 1; fn[t] += 1
 
-    return {
-        "macro_f1": float(f1_macro),
-        "acc": float(acc),
-        "confusion": cm.tolist(),
-        "per_class_f1": per_f1,
-        "n_test": int(y.shape[0]),
-    }
+    acc = n_correct / max(1, n_total)
+    n_cls = max(1, max(list(tp.keys()) + list(fp.keys()) + list(fn.keys()) + [0]) + 1)
+    f1s = []
+    for k in range(n_cls):
+        precision = tp[k] / max(1, tp[k] + fp[k])
+        recall = tp[k] / max(1, tp[k] + fn[k])
+        f1 = 0.0 if (precision + recall) == 0 else 2 * precision * recall / (precision + recall)
+        f1s.append(f1)
+    return {"acc": float(acc), "macro_f1": float(np.mean(f1s) if f1s else 0.0)}
 
+def intended_match(pred_counts: Dict[str, int], target_name: str) -> float:
+    total = sum(pred_counts.values()) or 1
+    return pred_counts.get(target_name, 0) / total
 
-def train_model(model, Xtr, ytr, Xva, yva, device, epochs=8, lr=1e-3, class_weight="balanced", pbar=None, bs_train=256, bs_val=512):
-    model = model.to(device)
-    opt = torch.optim.AdamW(model.parameters(), lr=lr)
-    if class_weight == "balanced":
-        w = class_weights(ytr).to(device)
-        criterion = nn.CrossEntropyLoss(weight=w)
-    else:
-        criterion = nn.CrossEntropyLoss()
-
-    train_ds = torch.utils.data.TensorDataset(torch.from_numpy(Xtr), torch.from_numpy(ytr))
-    val_ds   = torch.utils.data.TensorDataset(torch.from_numpy(Xva), torch.from_numpy(yva))
-    tr_loader = torch.utils.data.DataLoader(train_ds, batch_size=bs_train, shuffle=True, drop_last=False)
-    va_loader = torch.utils.data.DataLoader(val_ds, batch_size=bs_val, shuffle=False, drop_last=False)
-
-    best = {"acc": -1.0, "state": None}
-    loop = range(epochs)
-    if pbar is not None:
-        loop = pbar(range(epochs), desc="train", leave=False)
-    for _ in loop:
-        model.train()
-        for xb, yb in tr_loader:
-            xb, yb = xb.to(device), yb.to(device)
-            opt.zero_grad()
-            loss = criterion(model(xb), yb)
-            loss.backward()
-            opt.step()
-        # quick val
-        with torch.no_grad():
-            model.eval()
-            all_logits, all_y = [], []
-            for xb, yb in va_loader:
-                xb = xb.to(device)
-                logits = model(xb)
-                all_logits.append(logits.cpu()); all_y.append(yb)
-            logits = torch.cat(all_logits, 0); yv = torch.cat(all_y, 0).numpy()
-            yh = logits.argmax(1).numpy()
-            acc = accuracy_score(yv, yh)
-            if acc > best["acc"]:
-                best["acc"] = acc
-                best["state"] = {k: v.cpu() for k, v in model.state_dict().items()}
-    return best
-
+# --------------------------------- Main --------------------------------------
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--real_dir", required=True, help="Directory with TUAR shards (train_*.npz, val_*.npz, test_*.npz)")
-    ap.add_argument("--fake_dir", help=".../synth_{artifact} (must contain samples.npy or x.npy)")
-    ap.add_argument("--augment_artifact", choices=ARTIFACT_SET, help="Target artifact name for recovery + augmentation")
-    ap.add_argument("--task", choices=["artifact"], default="artifact")
-    ap.add_argument("--arch", choices=["tiny", "resnet1d", "eegnet"], default="resnet1d")
+    ap.add_argument("--real_train", required=True)
+    ap.add_argument("--real_val", required=False, default=None)
+    ap.add_argument("--real_test", required=True)
+    ap.add_argument("--fake_dir", required=False, default=None)
+    ap.add_argument("--augment_artifact", type=str, default=None)
     ap.add_argument("--epochs", type=int, default=8)
     ap.add_argument("--batch", type=int, default=256)
     ap.add_argument("--lr", type=float, default=1e-3)
-    ap.add_argument("--limit_train", type=int, default=None)
-    ap.add_argument("--limit_val", type=int, default=None)
-    ap.add_argument("--limit_test", type=int, default=None)
-    ap.add_argument("--seed", type=int, default=1337)
-    ap.add_argument("--class_weight", choices=["none", "balanced"], default="balanced")
-    ap.add_argument("--label_key", default="y_artifact")
-    ap.add_argument("--tqdm", action="store_true")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
 
-    set_seed(args.seed)
-    device = device_pick()
+    os.makedirs(os.path.dirname(args.out), exist_ok=True)
 
-    # Mode validation
-    do_recovery_or_aug = (args.fake_dir is not None) and (args.augment_artifact is not None)
+    # Class order from dataset; fallback to TUAR 6-class if absent
+    CLASS_NAMES = load_label_map_from(args.real_train, args.real_test) or ARTIFACTS_CANON
+    NAME2IDX = {n: i for i, n in enumerate(CLASS_NAMES)}
+    print(f"[meta] class order: {CLASS_NAMES}")
 
-    # Load data (and filter to 6 classes)
-    Xtr, ytr = load_npz_split(args.real_dir, "train", args.limit_train, label_key=args.label_key)
-    Xva, yva = load_npz_split(args.real_dir, "val",   args.limit_val,   label_key=args.label_key)
-    Xte, yte = load_npz_split(args.real_dir, "test",  args.limit_test,  label_key=args.label_key)
+    # Data
+    train_loader = make_loader(args.real_train, CLASS_NAMES, args.batch, shuffle=True)
+    val_loader = make_loader(args.real_val, CLASS_NAMES, args.batch, shuffle=False) if args.real_val else None
+    test_loader = make_loader(args.real_test, CLASS_NAMES, args.batch, shuffle=False)
 
-    # Report histograms (helpful sanity check)
-    print("Class histogram (after filtering to 6 classes):")
-    print("  train:", hist(ytr))
-    print("  val  :", hist(yva))
-    print("  test :", hist(yte))
+    # Model / train
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    C = next(iter(train_loader))[0].shape[1]
+    model = SmallResNet1D(in_ch=C, n_cls=len(CLASS_NAMES)).to(device)
+    opt = torch.optim.AdamW(model.parameters(), lr=args.lr)
+    ce = nn.CrossEntropyLoss()
 
-    # Build & train baseline
-    pbar = tqdm if args.tqdm else None
-    in_ch = Xtr.shape[1]
-    model = make_model(args.arch, in_ch=in_ch, ncls=NUM_CLASSES)
-    best = train_model(model, Xtr, ytr, Xva, yva, device,
-                       epochs=args.epochs, lr=args.lr,
-                       class_weight=args.class_weight,
-                       pbar=pbar, bs_train=args.batch, bs_val=max(512, args.batch))
-    model.load_state_dict(best["state"])
+    for epoch in range(1, args.epochs + 1):
+        model.train()
+        for x, y in train_loader:
+            x = x.to(device); y = y.to(device)
+            opt.zero_grad(set_to_none=True)
+            ce(model(x), y).backward()
+            opt.step()
+        if val_loader:
+            m = eval_classifier(model, val_loader, device)
+            print(f"[epoch {epoch}] val acc={m['acc']:.3f} macro_f1={m['macro_f1']:.3f}")
 
-    # Baseline test
-    baseline = evaluate(model, Xte, yte, device, bs=max(512, args.batch))
-    out = {"arch": args.arch, "baseline": baseline}
+    baseline = eval_classifier(model, test_loader, device)
+    out = {"baseline": baseline}
+    print(f"[baseline] test acc={baseline['acc']:.3f} macro_f1={baseline['macro_f1']:.3f}")
 
-    # Recovery + Augmentation
-    if do_recovery_or_aug:
-        target = args.augment_artifact
-        target_idx = NAME2IDX[target]
+    # Recovery on fakes (optional)
+    if args.fake_dir:
+        pred_counts = {name: 0 for name in CLASS_NAMES}
 
-        # Recovery: predict fakes
-        Xfake = load_fake_dir(args.fake_dir)
-        with torch.no_grad():
+        xs = []
+        for fp in glob.glob(os.path.join(args.fake_dir, "*.npz")):
+            with np.load(fp, allow_pickle=True) as npz:
+                xs.append(npz["x"].astype(np.float32))
+        if not xs:
+            for fp in glob.glob(os.path.join(args.fake_dir, "*.npy")):
+                xs.append(np.load(fp).astype(np.float32))
+
+        if xs:
+            X = torch.tensor(np.concatenate(xs, axis=0))
             model.eval()
-            preds = []
-            loop = range(0, Xfake.shape[0], max(512, args.batch))
-            if pbar: loop = pbar(loop, desc=f"recovery:{target}", leave=False)
-            for i in loop:
-                xb = torch.from_numpy(Xfake[i:i+max(512, args.batch)]).to(device)
-                logits = model(xb)
-                preds.append(logits.argmax(1).cpu().numpy())
-            yhat = np.concatenate(preds, 0)
+            with torch.no_grad():
+                for i0 in tqdm(range(0, X.shape[0], args.batch), desc="recovery"):
+                    x = X[i0:i0+args.batch].to(device)
+                    pred = model(x).argmax(dim=1).cpu().numpy().tolist()
+                    for p in pred:
+                        pred_counts[CLASS_NAMES[p]] += 1
 
-        im = float((yhat == target_idx).mean()) if yhat.size else 0.0
-        counts = {name: int((yhat == idx).sum()) for name, idx in NAME2IDX.items()}
+        target_name = None
+        for jf in glob.glob(os.path.join(args.fake_dir, "*.json")):
+            try:
+                j = json.load(open(jf))
+                if "artifact" in j: target_name = str(j["artifact"]); break
+            except Exception:
+                pass
 
+        im = intended_match(pred_counts, target_name) if target_name else None
         out["recovery"] = {
-            "target": target,
-            "target_idx": target_idx,
-            "n_fake": int(Xfake.shape[0]),
-            "intended_match": im,
-            "pred_counts": counts,
+            "pred_counts": pred_counts,
+            "intended": target_name,
+            "intended_match": float(im) if im is not None else None,
+            "n_fake": int(sum(pred_counts.values())),
         }
+        print(f"[recovery] IM={out['recovery']['intended_match']} for '{target_name}'")
 
-        # Augmentation: add fakes with target label to train
-        yfake = np.full((Xfake.shape[0],), target_idx, dtype=np.int64)
-        Xtr_aug = np.concatenate([Xtr, Xfake], 0)
-        ytr_aug = np.concatenate([ytr, yfake], 0)
-
-        model_aug = make_model(args.arch, in_ch=in_ch, ncls=NUM_CLASSES)
-        best_aug = train_model(model_aug, Xtr_aug, ytr_aug, Xva, yva, device,
-                               epochs=args.epochs, lr=args.lr,
-                               class_weight=args.class_weight,
-                               pbar=pbar, bs_train=args.batch, bs_val=max(512, args.batch))
-        model_aug.load_state_dict(best_aug["state"])
-        aug = evaluate(model_aug, Xte, yte, device, bs=max(512, args.batch))
-
-        out["augmentation"] = {
-            "augment_artifact": target,
-            "n_train_base": int(Xtr.shape[0]),
-            "n_train_aug": int(Xtr_aug.shape[0]),
-            "macro_f1_base": float(baseline["macro_f1"]),
-            "macro_f1_aug": float(aug["macro_f1"]),
-            "delta_macro_f1": float(aug["macro_f1"] - baseline["macro_f1"]),
-            "acc_base": float(baseline["acc"]),
-            "acc_aug": float(aug["acc"]),
-            "delta_acc": float(aug["acc"] - baseline["acc"]),
-        }
-
-    # Write results
-    Path(os.path.dirname(args.out)).mkdir(parents=True, exist_ok=True)
     with open(args.out, "w") as f:
         json.dump(out, f, indent=2)
     print(f"[write] {args.out}")
-    if "recovery" in out:
-        print(f"IM={out['recovery']['intended_match']:.3f}, n_fake={out['recovery']['n_fake']}")
-    print(f"Baseline macro-F1={baseline['macro_f1']:.3f} acc={baseline['acc']:.3f}")
-
 
 if __name__ == "__main__":
     main()

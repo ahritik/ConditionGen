@@ -1,31 +1,54 @@
-ARTIFACT_SET = ["none","eye","muscle","chewing","shiver","electrode","movement"]
-CANON_CH = ["Fp1","Fp2","C3","C4","P3","P4","O1","O2"]
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+utils/constants.py
+------------------
+Central constants for TUAR preprocessing and training.
 
-ARTIFACT_MAP_TUAR = {
-    "eyem":"eye", "eye":"eye",
-    "musc":"muscle", "muscle":"muscle",
-    "chew":"chewing", "chewing":"chewing",
-    "shiv":"shiver", "shiver":"shiver",
-    "elec":"electrode", "electrode":"electrode",
-    "move":"movement", "movement":"movement",
-    "none":"none", "clean":"none"
-}
+- ARTIFACT_SET is the canonical 6-class taxonomy for TUAR (no "movement").
+- CANON_CH defines the 8 canonical EEG channels we extract from varied montages.
+- age_to_bin_idx() maps a numeric age to one of 4 discrete bins used in
+  the 12-D conditioning vector (6 art one-hot + 1 seizure + 4 age one-hot + 1 montage).
+"""
 
-AGE_BINS = [(0,12),(13,25),(26,60),(61,200)]  # years; inclusive lower, inclusive upper
+from __future__ import annotations
+from typing import List
 
-def tuar_label_to_artifact(s: str) -> str:
-    s = (s or "").strip().lower()
-    return ARTIFACT_MAP_TUAR.get(s, "none")
+# -----------------------------------------------------------------------------
+# Canonical TUAR artifact set (6 classes; NO "movement")
+# Order here defines the integer ids written into NPZ shards and label_map.json
+# -----------------------------------------------------------------------------
+ARTIFACT_SET: List[str] = ["none", "eye", "muscle", "chewing", "shiver", "electrode"]
 
-def age_to_bin_idx(age_years: float) -> int:
-    for i,(lo,hi) in enumerate(AGE_BINS):
-        if age_years >= lo and age_years <= hi:
-            return i
-    return 2  # default to adult
+# -----------------------------------------------------------------------------
+# Canonical 8-channel layout we target when canonicalizing TUAR montages
+# (Fp1,Fp2,F3,F4,C3,C4,O1,O2). Keep case as shown; the converter normalizes.
+# -----------------------------------------------------------------------------
+CANON_CH: List[str] = ["Fp1", "Fp2", "F3", "F4", "C3", "C4", "O1", "O2"]
 
-BANDS = {
-    "delta": (0.5,4.0),
-    "theta": (4.0,8.0),
-    "alpha": (8.0,13.0),
-    "beta":  (13.0,30.0),
-}
+# -----------------------------------------------------------------------------
+# Age → 4-bin mapping used by the conditioning vector
+# Adjust bins if your study pre-specifies different cut points; the model only
+# sees 4 one-hot bins, not the raw age.
+# -----------------------------------------------------------------------------
+def age_to_bin_idx(age: int | float | None) -> int:
+    """
+    Map a (possibly missing) patient age to one of 4 discrete bins (0..3).
+
+    Default bins:
+      0: < 18 years
+      1: 18–39
+      2: 40–64
+      3: 65+
+
+    Returns: int in {0,1,2,3}
+    """
+    a = 40 if age is None else int(age)
+    if a < 18:
+        return 0
+    elif a < 40:
+        return 1
+    elif a < 65:
+        return 2
+    else:
+        return 3

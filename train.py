@@ -1,336 +1,283 @@
-# train.py
-# Training script for ConditionGen diffusion model (TUAR 8-ch EEG windows)
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+train.py
+--------
+Training script for ConditionGen on TUAR NPZ shards (6-class taxonomy; no movement).
+
+- Conditioning: 12-D = 6(one-hot artifact) + 1(seizure) + 4(one-hot age) + 1(montage scalar)
+- Class order read from dataset's label_map.json; a copy is saved to --log_dir
+- Supports NEW shard keys (artifact, seizure, age_bin, montage_id) and LEGACY (y_*)
+- tqdm progress bars + TensorBoard scalars (optional)
+
+Usage:
+  python train.py \
+    --npz_dir out/tuar_npz/train --val_npz_dir out/tuar_npz/val \
+    --log_dir out/runs/condgen_tuar_6cls --epochs 50 --batch 256 --lr 2e-4 --timesteps 1000
+"""
 from __future__ import annotations
-import os, glob, csv, json, math, argparse, random
-from typing import List, Tuple
-import contextlib
+import os, glob, csv, json, argparse, random
+from typing import List
 
 import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
+from tqdm import tqdm
 
-from models.unet1d_film import UNet1DFiLM
-from models.diffusion import Diffusion1D as Diffusion, EMA
+# TensorBoard is optional
+try:
+    from torch.utils.tensorboard import SummaryWriter  # type: ignore
+except Exception:  # pragma: no cover
+    SummaryWriter = None  # type: ignore
 
-# ---- constants (keep in sync with utils/constants.py) ----
-ARTIFACT_SET = ["none","eye","muscle","chewing","shiver","electrode","movement"]
-N_CH = 8
-T_SAMPLES = 800  # 4s @ 200Hz
+# Robust imports (with or without a 'models' package)
+try:
+    from models.unet1d_film import UNet1DFiLM
+except ImportError:
+    from unet1d_film import UNet1DFiLM
+
+try:
+    from models.diffusion import Diffusion, EMA
+except ImportError:
+    from diffusion import Diffusion, EMA
+
+from models.conditioning import save_label_map, load_label_map_from, build_cond_np, ARTIFACTS_CANON
 
 
-# ---------------- data ----------------
+# ------------------------------- Dataset -------------------------------------
 
-class NPZWindows(Dataset):
+class TUARDataset(Dataset):
     """
-    Loads a list of NPZ files (e.g., train_*.npz). Each file has arrays:
-        x: [N, C=8, T=800] float32
-        a: [N] artifact idx in [0..6]
-        s: [N] seizure flag {0,1} (optional -> zeros)
-        g: [N] age bin idx in [0..3] (optional -> zeros)
-        m: [N] montage id idx (optional -> zeros)
-    """
-    def __init__(self, npz_dir: str, split: str):
-        paths = sorted(glob.glob(os.path.join(npz_dir, f"{split}_*.npz")))
-        if not paths:
-            raise FileNotFoundError(f"No NPZ files found: {npz_dir}/{split}_*.npz")
-        Xs, As, Ss, Gs, Ms = [], [], [], [], []
-        for p in paths:
-            with np.load(p) as z:
-                key = "x" if "x" in z.files else z.files[0]
-                x = z[key].astype(np.float32)
-                a = (z["a"] if "a" in z.files else z.get("y_artifact", np.zeros(len(x), np.int64))).astype(np.int64)
-                s = (z["s"] if "s" in z.files else np.zeros(len(x), np.int64)).astype(np.int64)
-                g = (z["g"] if "g" in z.files else np.zeros(len(x), np.int64)).astype(np.int64)
-                m = (z["m"] if "m" in z.files else np.zeros(len(x), np.int64)).astype(np.int64)
-                Xs.append(x); As.append(a); Ss.append(s); Gs.append(g); Ms.append(m)
-        self.x = np.concatenate(Xs, 0)
-        self.a = np.concatenate(As, 0)
-        self.s = np.concatenate(Ss, 0)
-        self.g = np.concatenate(Gs, 0)
-        self.m = np.concatenate(Ms, 0)
+    Minimal TUAR NPZ dataset loader.
 
-    def __len__(self): return self.x.shape[0]
+    Accepts NPZ shards with either:
+      NEW: x, artifact, seizure, age_bin, montage_id, intensity
+      OLD: x, y_artifact, y_seizure, y_agebin, y_montage, intensity
+    """
+    def __init__(self, root: str, class_names: List[str], shuffle_files: bool = True):
+        super().__init__()
+        self.root = root
+        self.class_names = class_names
+        self.name2idx = {n: i for i, n in enumerate(class_names)}
+
+        self.files = sorted(glob.glob(os.path.join(root, "*.npz")))
+        if shuffle_files:
+            random.shuffle(self.files)
+        if not self.files:
+            raise RuntimeError(f"No .npz shards found under {root}")
+
+        self._index = []  # list of (file_idx, row_idx)
+        for fi, f in enumerate(self.files):
+            with np.load(f) as npz:
+                n = npz["x"].shape[0]
+            self._index.extend([(fi, i) for i in range(n)])
+
+        self._cache = None  # (fi, npz_obj)
+
+    def __len__(self):
+        return len(self._index)
+
+    def _open(self, fi: int):
+        return np.load(self.files[fi])
 
     def __getitem__(self, idx: int):
-        x = self.x[idx]
-        a = int(self.a[idx]); s = int(self.s[idx]); g = int(self.g[idx]); m = int(self.m[idx])
-        cond = build_cond(a, s, g, m)  # 13-dim
+        fi, row = self._index[idx]
+        if self._cache is None or self._cache[0] != fi:
+            if self._cache is not None:
+                try:
+                    self._cache[1].close()
+                except Exception:
+                    pass
+            self._cache = (fi, self._open(fi))
+        z = self._cache[1]
+
+        x = z["x"][row].astype(np.float32)  # [C,T]
+
+        def pick(*keys, default=None):
+            for k in keys:
+                if k in z:
+                    return z[k][row]
+            if default is None:
+                raise KeyError(f"None of keys {keys} found in shard")
+            return default
+
+        a = pick("artifact", "y_artifact")
+        if isinstance(a, (np.str_, str, bytes)):  # string labels rare
+            a = self.name2idx[str(a)]
+        else:
+            a = int(a)
+
+        s = int(pick("seizure", "y_seizure"))
+        g = int(pick("age_bin", "y_agebin"))
+        m = int(pick("montage_id", "y_montage"))
+
+        cond = build_cond_np(
+            artifact_idx=a, seizure=s, age_bin=g, montage_id=m, n_artifacts=len(self.class_names)
+        ).astype(np.float32)
+
         return torch.from_numpy(x), torch.from_numpy(cond)
 
 
-def one_hot(i: int, n: int) -> np.ndarray:
-    v = np.zeros(n, dtype=np.float32); v[i] = 1.0; return v
+def make_loader(root: str, class_names: List[str], batch: int, shuffle: bool,
+                pin_memory: bool, num_workers: int = 4) -> DataLoader:
+    ds = TUARDataset(root, class_names, shuffle_files=shuffle)
+    return DataLoader(ds, batch_size=batch, shuffle=shuffle, drop_last=True,
+                      num_workers=num_workers, pin_memory=pin_memory)
 
-def build_cond(artifact_idx: int, seizure: int, age_bin: int, montage_id: int) -> np.ndarray:
-    """
-    13-D condition vector to match checkpoints:
-      [artifact_onehot(7)] + [seizure(1)] + [age_onehot(4)] + [montage_id_scalar(1)]
-    (No intensity term here; intensity is only used at sampling time.)
-    """
-    a = one_hot(artifact_idx, 7)
-    s = np.array([float(seizure)], dtype=np.float32)
-    g = one_hot(age_bin, 4)
-    m = np.array([float(montage_id)], dtype=np.float32)
-    return np.concatenate([a, s, g, m], axis=0).astype(np.float32)
 
-# ------------ make model ---------------
-def make_unet(n_ch=8, widths=(64,128,256), cond_dim=13):
-    import inspect
-    sig = inspect.signature(UNet1DFiLM.__init__)
-    names = list(sig.parameters.keys())
-    # try common arg names for "input channels"
-    for k in ("in_channels","in_chans","in_ch","ch_in","channels","C_in","c_in","n_channels"):
-        if k in names:
-            kwargs = {k: n_ch}
-            if "widths" in names: kwargs["widths"] = widths
-            if "cond_dim" in names: kwargs["cond_dim"] = cond_dim
-            return UNet1DFiLM(**kwargs)
-    # last resort: call with only supported args
-    kwargs = {}
-    if "widths" in names: kwargs["widths"] = widths
-    if "cond_dim" in names: kwargs["cond_dim"] = cond_dim
-    return UNet1DFiLM(**kwargs)
-
-# ---------------- utils ----------------
+# ------------------------------- Utilities -----------------------------------
 
 def pick_device():
-    if torch.backends.mps.is_available():
-        return torch.device("mps"), "mps"
     if torch.cuda.is_available():
         return torch.device("cuda"), "cuda"
+    if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+        return torch.device("mps"), "mps"
     return torch.device("cpu"), "cpu"
 
-class NullScaler:
-    def scale(self, x): return x
-    def step(self, opt): opt.step()
-    def update(self): pass
-    def __enter__(self): return self
-    def __exit__(self, *args): return False
 
-def save_ckpt(path, step, model, opt, ema):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    torch.save({
-        "step": step,
-        "model": model.state_dict(),
-        "opt": opt.state_dict(),
-        "ema": ema.state_dict() if ema is not None else None,
-    }, path)
-    print(f"[save] {path} (step={step})")
-
-def load_ckpt(path, model, opt=None, ema=None, device="cpu"):
-    ckpt = torch.load(path, map_location=device)
-    step = int(ckpt.get("step", 0))
-
-    # locate model state_dict
-    cand_keys = ["model", "state_dict", "net", "weights"]
-    sd = None
-    for k in cand_keys:
-        if k in ckpt and isinstance(ckpt[k], dict):
-            sd = ckpt[k]; break
-    if sd is None:
-        if any(isinstance(v, torch.Tensor) for v in ckpt.values()):
-            sd = ckpt
-        else:
-            raise RuntimeError("No model state_dict found in checkpoint")
-
-    # filter to current model
-    msd = model.state_dict()
-    filtered = {k: v for k, v in sd.items()
-                if k in msd and isinstance(v, torch.Tensor) and msd[k].shape == v.shape}
-    missing = [k for k in msd.keys() if k not in filtered]
-    unexpected = [k for k in sd.keys() if k not in msd]
-
-    model.load_state_dict(filtered, strict=False)
-    print(f"[load] model: loaded {len(filtered)}/{len(msd)} tensors "
-          f"(missing {len(missing)}, unexpected {len(unexpected)})")
-
-    if opt is not None:
-        for k in ("opt", "optimizer", "opt_state"):
-            if k in ckpt:
-                try:
-                    opt.load_state_dict(ckpt[k])
-                    print("[load] optimizer: ok")
-                except Exception as e:
-                    print(f"[load] optimizer: skipped ({e})")
-                break
-
-    if ema is not None and "ema" in ckpt and ckpt["ema"] is not None:
-        try:
-            ema.load_state_dict(ckpt["ema"])
-            print("[load] ema: ok")
-        except Exception as e:
-            maybe = ckpt["ema"]
-            if isinstance(maybe, dict) and all(isinstance(v, torch.Tensor) for v in maybe.values()):
-                try:
-                    for name, ten in maybe.items():
-                        if name in ema.shadow:
-                            ema.shadow[name] = ten.clone()
-                    print("[load] ema: ok (shadow fallback)")
-                except Exception as e2:
-                    print(f"[load] ema: skipped ({e2})")
-            else:
-                print(f"[load] ema: skipped ({e})")
-
-    return step, ckpt
+def save_ckpt(path: str, step: int, net: nn.Module, opt: torch.optim.Optimizer, ema):
+    os.makedirs(os.path.dirname(path), exist_ok=True, mode=0o755)
+    state = {"step": step, "model": net.state_dict(), "opt": opt.state_dict()}
+    if ema is not None:
+        state["ema"] = ema.state_dict()
+    torch.save(state, path)
 
 
-# ---------------- main ----------------
+# --------------------------------- Main --------------------------------------
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--npz_dir", required=True)
+    ap.add_argument("--npz_dir", required=True, help="training NPZ folder")
+    ap.add_argument("--val_npz_dir", default=None, help="optional validation NPZ folder")
     ap.add_argument("--log_dir", required=True)
-    ap.add_argument("--batch", type=int, default=32)
-    ap.add_argument("--steps", type=int, default=200000, help="target GLOBAL step (not epochs)")
-    ap.add_argument("--lr", type=float, default=1e-4)
+    ap.add_argument("--epochs", type=int, default=50)
+    ap.add_argument("--batch", type=int, default=256)
+    ap.add_argument("--lr", type=float, default=2e-4)
+    ap.add_argument("--ema_decay", type=float, default=0.999)
     ap.add_argument("--stft_win", type=int, default=128)
     ap.add_argument("--stft_hop", type=int, default=64)
     ap.add_argument("--lambda_stft", type=float, default=0.1)
-    ap.add_argument("--resume", type=str, default="")
-    ap.add_argument("--ckpt_every", type=int, default=5000)
-    ap.add_argument("--log_tb", action="store_true")
-    ap.add_argument("--no_amp", action="store_true", help="disable AMP (use fp32)")
+    ap.add_argument("--timesteps", type=int, default=1000)
+    ap.add_argument("--no_amp", action="store_true")
+    ap.add_argument("--tb_every", type=int, default=10, help="log scalars to TensorBoard every N steps (0=off)")
     args = ap.parse_args()
 
     os.makedirs(args.log_dir, exist_ok=True)
+
+    # 1) Class order from dataset label_map.json (TUAR: 6 classes)
+    class_names = load_label_map_from(args.npz_dir) or ARTIFACTS_CANON
+    n_artifacts = len(class_names)
+    lm_path = save_label_map(args.log_dir, class_names)
+    print(f"[meta] wrote {lm_path} with {n_artifacts} classes: {class_names}")
+
+    # 2) Device
     device, devtype = pick_device()
     print(f"[device] {devtype}")
 
-    # model
-    net = make_unet(n_ch=N_CH, widths=(64,128,256), cond_dim=13).to(device)
-    net.to(device)
+    # pin memory only helps (and is supported) on CUDA
+    pin_mem = (device.type == "cuda")
 
+    # 3) Data — also infer channels C safely from one sample
+    tmp_ds = TUARDataset(args.npz_dir, class_names, shuffle_files=False)
+    C = int(tmp_ds[0][0].shape[0])
+    del tmp_ds
+
+    train_loader = make_loader(args.npz_dir, class_names, args.batch, shuffle=True,
+                               pin_memory=pin_mem, num_workers=4)
+    val_loader = None
+    if args.val_npz_dir and os.path.isdir(args.val_npz_dir):
+        val_loader = make_loader(args.val_npz_dir, class_names, args.batch, shuffle=False,
+                                 pin_memory=pin_mem, num_workers=2)
+
+    # 4) Model (UNet with FiLM expecting cond_dim = n_artifacts + 6 -> 12 for TUAR)
+    cond_dim = n_artifacts + 6
+    # NOTE: match your UNet1DFiLM signature (c_in / c_hidden), not channels/widths
+    net = UNet1DFiLM(c_in=C, c_hidden=(64, 128, 256), cond_dim=cond_dim).to(device)
+
+    # 5) Diffusion wrapper (v-pred + optional STFT-L1)
     model = Diffusion(
-        net, T=1000,
-        stft_win=args.stft_win, stft_hop=args.stft_hop,
-        lambda_stft=args.lambda_stft, snr_clip=5.0, schedule="cosine"
+        net, T=args.timesteps, stft_win=args.stft_win, stft_hop=args.stft_hop, lambda_stft=args.lambda_stft
     ).to(device)
 
-    # optimizer + EMA
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr)
-    ema = EMA(net, beta=0.999)  # tracks the UNet weights
-    ema.to(device)
+    scaler = torch.cuda.amp.GradScaler(enabled=(not args.no_amp and device.type == "cuda"))
+    ema = EMA(model, decay=args.ema_decay)
 
-    # data
-    ds_train = NPZWindows(args.npz_dir, "train")
-    ds_val   = NPZWindows(args.npz_dir, "val")
-    dl = DataLoader(ds_train, batch_size=args.batch, shuffle=True, drop_last=True, num_workers=0)
-    it = iter(dl)
-
-    # AMP
-    use_amp = (not args.no_amp) and (devtype in ("cuda", "mps"))
-    if devtype == "cuda" and use_amp:
-        scaler = torch.amp.GradScaler("cuda")
-        autocast_ctx = torch.amp.autocast("cuda", dtype=torch.float16)
-    elif devtype == "mps" and use_amp:
-        # MPS fp16 is fast but can produce NaNs; leave enabled only if stable
-        scaler = NullScaler()
-        autocast_ctx = torch.amp.autocast("mps", dtype=torch.float16)
-    else:
-        # pure fp32 (safe mode)
-        scaler = NullScaler()
-        autocast_ctx = contextlib.nullcontext()
-
-    # resume
-    start_step = 0
-    if args.resume:
-        start_step, _ = load_ckpt(args.resume, model, opt, ema, device=device)
-        print(f"[resume] Loaded checkpoint at global step {start_step}")
-
-    # logging
+    # 6) Logging: CSV + optional TensorBoard
     csv_path = os.path.join(args.log_dir, "train_log.csv")
-    csv_f = open(csv_path, "a", newline="")
-    csv_w = csv.writer(csv_f)
-    if os.path.getsize(csv_path) == 0:
-        csv_w.writerow(["step","loss_total","loss_base","loss_stft","lr"])
-
-    tb = None
-    if args.log_tb:
+    tb_dir = os.path.join(args.log_dir, "tb")
+    writer = None
+    if SummaryWriter is not None and args.tb_every > 0:
         try:
-            from torch.utils.tensorboard import SummaryWriter
-            tb = SummaryWriter(args.log_dir)
-        except Exception as e:
-            print(f"[tb] failed to init tensorboard: {e}")
+            writer = SummaryWriter(log_dir=tb_dir)
+            print(f"[tb] logging to {tb_dir} (every {args.tb_every} steps)")
+        except Exception as e:  # pragma: no cover
+            print(f"[tb] disabled ({e})")
 
-    # helper to sample a small val batch and log PSD-ish proxy (optional)
-    def log_parts(step, loss, parts):
-        csv_w.writerow([step, float(loss), parts.get("base",0.0), parts.get("stft_l1",0.0), args.lr])
-        csv_f.flush()
-        if tb:
-            tb.add_scalar("loss/total", float(loss), step)
-            tb.add_scalar("loss/base",  parts.get("base",0.0), step)
-            tb.add_scalar("loss/stft",  parts.get("stft_l1",0.0), step)
-            tb.add_scalar("misc/snr_mean", parts.get("snr_mean",0.0), step)
+    with open(csv_path, "w", newline="") as csv_f:
+        csv_w = csv.writer(csv_f)
+        csv_w.writerow(["epoch", "step", "loss", "base", "stft_l1", "snr_mean", "lr"])
 
-    # train loop
-    model.train()
-    step = start_step
-    from tqdm import trange
-    pbar = trange(start_step, args.steps, initial=start_step, total=args.steps, desc="Train")
+        # 7) Train
+        step = 0
+        model.train()
+        for epoch in range(1, args.epochs + 1):
+            pbar = tqdm(train_loader, desc=f"epoch {epoch}/{args.epochs}", dynamic_ncols=True, leave=False)
+            for x, c in pbar:
+                x = x.to(device)            # [B,C,T]
+                c = c.to(device)            # [B,cond_dim]
 
-    while step < args.steps:
-        try:
-            x, cond = next(it)
-        except StopIteration:
-            dl = DataLoader(ds_train, batch_size=args.batch, shuffle=True, drop_last=True, num_workers=0)
-            it = iter(dl)
-            x, cond = next(it)
-
-        x = x.to(device, non_blocking=True)
-        cond = cond.to(device, non_blocking=True)
-
-        with autocast_ctx:
-            t = torch.randint(0, model.timesteps, (x.size(0),), device=device, dtype=torch.long)
-            loss, parts = model(x, cond, t)
-        
-            # --- NaN/Inf guard ---
-            if not torch.isfinite(loss):
-                print(f"[warn] non-finite loss at step {step}; skipping and reducing LR")
-                for pg in opt.param_groups:
-                    pg["lr"] = pg["lr"] * 0.5
-                # zero grad & re-init batch
                 opt.zero_grad(set_to_none=True)
-                # optional: turn off AMP if it was on
-                use_amp = False
-                # skip update
+                with torch.cuda.amp.autocast(enabled=(not args.no_amp and device.type == "cuda")):
+                    loss, parts = model(x, c)
+                scaler.scale(loss).backward()
+                scaler.step(opt)
+                scaler.update()
+                ema.update(model)
+
+                base = float(parts.get("base", 0.0))
+                stft = float(parts.get("stft_l1", 0.0))
+                snr  = float(parts.get("snr_mean", 0.0))
+                lval = float(loss.detach().cpu())
+                lr   = float(opt.param_groups[0]["lr"])
+
+                # CSV log every 50 steps
+                if step % 50 == 0:
+                    csv_w.writerow([epoch, step, lval, base, stft, snr, lr])
+
+                # TensorBoard log (lightweight cadence)
+                if writer is not None and args.tb_every > 0 and (step % args.tb_every == 0):
+                    writer.add_scalar("loss/total", lval, step)
+                    writer.add_scalar("loss/base",  base, step)
+                    writer.add_scalar("loss/stft_l1", stft, step)
+                    writer.add_scalar("snr/mean", snr, step)
+                    writer.add_scalar("opt/lr", lr, step)
+
+                # tqdm postfix occasionally
+                if step % 10 == 0:
+                    pbar.set_postfix(loss=lval, base=base, stft=stft)
+
+                # Periodic checkpoints
+                if step % 1000 == 0 and step > 0:
+                    ckdir = os.path.join(args.log_dir, "checkpoints")
+                    save_ckpt(os.path.join(ckdir, f"step_{step}.pt"), step, model, opt, ema)
+                    save_ckpt(os.path.join(ckdir, "last.pt"), step, model, opt, ema)
+
                 step += 1
-                continue
 
-
-        opt.zero_grad(set_to_none=True)
-        if isinstance(scaler, NullScaler):
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            opt.step()
-        else:
-            scaler.scale(loss).backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            scaler.step(opt)
-            scaler.update()
-
-        # EMA update on the UNet (not the wrapper)
-        ema.update(net)
-
-        step += 1
-        pbar.update(1)
-        if step % 50 == 0:
-            log_parts(step, loss.item(), parts)
-
-        if step % args.ckpt_every == 0 or step == args.steps:
+            # Epoch-end checkpoint
             ckdir = os.path.join(args.log_dir, "checkpoints")
-            os.makedirs(ckdir, exist_ok=True)
-            # standard step checkpoint
-            save_ckpt(os.path.join(ckdir, f"step_{step}.pt"), step, model, opt, ema)
-            # update last.pt
+            save_ckpt(os.path.join(ckdir, f"epoch_{epoch}.pt"), step, model, opt, ema)
             save_ckpt(os.path.join(ckdir, "last.pt"), step, model, opt, ema)
-            # EMA export for sampling
-            # (copy EMA -> net -> wrap into a "model" dict with wrapper schedule as well)
-            # Users will typically sample with sample.py which already handles EMA.
-            pass
+            print(f"[epoch {epoch}] last loss={lval:.4f}")
 
-    csv_f.close()
-    if tb: tb.close()
+    if writer is not None:
+        writer.close()
+
+    print(f"[done] wrote log to {csv_path}")
+    if writer is not None:
+        print(f"[tb] view with: tensorboard --logdir \"{tb_dir}\" --port 6006")
 
 
 if __name__ == "__main__":
