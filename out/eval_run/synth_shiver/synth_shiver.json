@@ -1,0 +1,27 @@
+{
+  "ckpt": "out/runs/condgen_tuar/checkpoints/last.pt",
+  "step": 10400,
+  "class_names": [
+    "none",
+    "eye",
+    "muscle",
+    "chewing",
+    "shiver",
+    "electrode"
+  ],
+  "artifact": "shiver",
+  "artifact_idx": 4,
+  "n": 3000,
+  "steps": 80,
+  "guidance": 1.0,
+  "eta": 0.0,
+  "batch": 256,
+  "shape": [
+    8,
+    800
+  ],
+  "seizure": 0,
+  "age_bin": 1,
+  "montage_id": 0,
+  "sampler": "ddim"
+}

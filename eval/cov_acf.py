@@ -72,6 +72,7 @@ def main():
     ap.add_argument("--limit_fake", type=int, default=None)
     ap.add_argument("--nlags", type=int, default=150)
     ap.add_argument("--out", required=True)
+    ap.add_argument("--tqdm", action="store_true")
     args = ap.parse_args()
 
     real = _stack_npz_dir(args.real_dir, args.split, limit=args.limit_real)

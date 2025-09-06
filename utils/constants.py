@@ -27,6 +27,17 @@ ARTIFACT_SET: List[str] = ["none", "eye", "muscle", "chewing", "shiver", "electr
 CANON_CH: List[str] = ["Fp1", "Fp2", "F3", "F4", "C3", "C4", "O1", "O2"]
 
 # -----------------------------------------------------------------------------
+# Standard EEG bands used by eval/psd.py
+# (Aligned with our preprocessing: bandpass 0.5–45 Hz)
+# -----------------------------------------------------------------------------
+BANDS = {
+    "delta": (0.5, 4.0),
+    "theta": (4.0, 8.0),
+    "alpha": (8.0, 13.0),
+    "beta":  (13.0, 30.0),
+}
+
+# -----------------------------------------------------------------------------
 # Age → 4-bin mapping used by the conditioning vector
 # Adjust bins if your study pre-specifies different cut points; the model only
 # sees 4 one-hot bins, not the raw age.

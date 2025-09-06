@@ -19,7 +19,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from conditioning import build_cond_np, ARTIFACTS_CANON
+from models.conditioning import build_cond_np, ARTIFACTS_CANON
 
 def _load_label_map(npz_dir: str):
     lm = os.path.join(npz_dir, "label_map.json")

@@ -5,7 +5,7 @@ train.py
 --------
 Training script for ConditionGen on TUAR NPZ shards (6-class taxonomy; no movement).
 
-- Conditioning: 12-D = 6(one-hot artifact) + 1(seizure) + 4(one-hot age) + 1(montage scalar)
+- models.conditioning: 12-D = 6(one-hot artifact) + 1(seizure) + 4(one-hot age) + 1(montage scalar)
 - Class order read from dataset's label_map.json; a copy is saved to --log_dir
 - Supports NEW shard keys (artifact, seizure, age_bin, montage_id) and LEGACY (y_*)
 - tqdm progress bars + TensorBoard scalars (optional)

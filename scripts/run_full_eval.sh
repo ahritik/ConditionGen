@@ -69,13 +69,13 @@ fi
 if [[ "$FORCE_REEVAL" == "1" ]]; then
   for A in $ARTS; do
     echo "[fidelity] PSD | $A"
-    python psd.py \
+    python eval/psd.py \
       --real_dir "$REAL_TEST" \
       --fake_dir "$RUN_DIR/synth_${A}" \
       --out "$EVAL_DIR/psd_${A}.json"
 
     echo "[fidelity] Cov/ACF | $A"
-    python cov_acf.py \
+    python eval/cov_acf.py \
       --real_dir "$REAL_TEST" \
       --fake_dir "$RUN_DIR/synth_${A}" \
       --out "$EVAL_DIR/covacf_${A}.json"
@@ -88,7 +88,7 @@ fi
 # Our classifier_eval.py expects explicit train/val/test dirs (+ optional fake_dir)
 for A in $ARTS; do
   echo "[recovery] $A"
-  python classifier_eval.py \
+  python -m eval.classifier_eval \
     --real_train "$REAL_TRAIN" \
     --real_val   "$REAL_VAL" \
     --real_test  "$REAL_TEST" \
@@ -100,7 +100,7 @@ done
 if [[ "$DO_EXTRA" == "1" ]]; then
   for A in $ARTS; do
     echo "[extra] stat92 | $A"
-    python extra_metrics.py \
+    python eval/extra_metrics.py \
       --real_dir "$REAL_TEST" --fake_dir "$RUN_DIR/synth_${A}" \
       --feature_kind stat92 --out "$EVAL_DIR/extra_${A}_stat92.json"
 

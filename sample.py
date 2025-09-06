@@ -26,7 +26,7 @@ except ImportError:
     from unet1d_film import UNet1DFiLM
     from diffusion import Diffusion
 
-from conditioning import load_label_map_from, build_cond_torch, ARTIFACTS_CANON
+from models.conditioning import load_label_map_from, build_cond_torch, ARTIFACTS_CANON
 
 def pick_device():
     if torch.cuda.is_available(): return torch.device("cuda"), "cuda"
@@ -72,7 +72,7 @@ def main():
     device, dev = pick_device()
     C, T = int(args.shape[0]), int(args.shape[1])
     cond_dim = n_artifacts + 6  # 6: seizure(1) + age(4) + montage(1)
-    net = UNet1DFiLM(channels=C, widths=(64, 128, 256), cond_dim=cond_dim).to(device)
+    net = UNet1DFiLM(c_in=C, c_hidden=(64, 128, 256), cond_dim=cond_dim).to(device)
     model = Diffusion(net, T=1000).to(device)
     step = load_ckpt(args.ckpt, model)
     print(f"[ckpt] loaded step={step} on {dev}")
