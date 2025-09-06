@@ -1,0 +1,16 @@
+{
+  "arts": [
+    "none",
+    "eye",
+    "muscle",
+    "chewing",
+    "shiver",
+    "electrode"
+  ],
+  "schema": "[artifact_onehot | intensity]",
+  "has_intensity": true,
+  "has_seizure": false,
+  "age_bins": 1,
+  "montages": 1,
+  "artifact_offset": 0
+}

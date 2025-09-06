@@ -1,0 +1,9 @@
+{
+  "artifact": "electrode",
+  "delta_delta": 0.2228829562664032,
+  "delta_theta": 0.0027137212455272675,
+  "delta_alpha": 0.001208883710205555,
+  "delta_beta": 0.0050063710659742355,
+  "n_real": 2000,
+  "n_fake": 800
+}

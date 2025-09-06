@@ -1,0 +1,32 @@
+{
+  "meta": {
+    "class_names": [
+      "none",
+      "eye",
+      "muscle",
+      "chewing",
+      "shiver",
+      "electrode"
+    ],
+    "fs": 200,
+    "feature": "bp_stat_spatial",
+    "add_spec_slope": true,
+    "k": 21,
+    "metric": "euclidean",
+    "weighted": true,
+    "stride": 4,
+    "limit_train_per_class": 3000,
+    "limit_test": 10000,
+    "limit_fake": 8000,
+    "standardize": true
+  },
+  "baseline": {
+    "acc": 0.43995430529772955,
+    "macro_f1": 0.31994936390557577,
+    "n": 7003
+  },
+  "recovery": {
+    "n_fake": 750,
+    "intended_match": 1.0
+  }
+}

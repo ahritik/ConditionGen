@@ -1,0 +1,9 @@
+{
+  "artifact": "muscle",
+  "delta_delta": 0.12897880375385284,
+  "delta_theta": 0.006946357898414135,
+  "delta_alpha": 0.0038112495094537735,
+  "delta_beta": 0.0041758525185287,
+  "n_real": 3000,
+  "n_fake": 800
+}

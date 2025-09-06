@@ -1,0 +1,9 @@
+{
+  "artifact": "shiver",
+  "delta_delta": 0.1293555200099945,
+  "delta_theta": 0.006628445349633694,
+  "delta_alpha": 0.0033942479640245438,
+  "delta_beta": 0.004562757443636656,
+  "n_real": 3000,
+  "n_fake": 800
+}

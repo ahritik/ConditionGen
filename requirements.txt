@@ -11,3 +11,5 @@ scikit-learn
 tensorboard
 psutil
 pyyaml
+tqdm
+tensorboard

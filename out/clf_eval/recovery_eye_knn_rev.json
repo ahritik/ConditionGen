@@ -1,0 +1,18 @@
+{
+  "classes": [
+    "none",
+    "eye",
+    "muscle",
+    "chewing",
+    "shiver",
+    "electrode"
+  ],
+  "baseline": {
+    "macro_f1": 0.30179063298949665,
+    "acc": 0.43440887006353557
+  },
+  "recovery": {
+    "intended_match": 0.0,
+    "n_fake": 400
+  }
+}

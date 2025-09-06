@@ -1,0 +1,9 @@
+{
+  "artifact": "chewing",
+  "delta_delta": 0.012935616075992584,
+  "delta_theta": 0.005172972567379475,
+  "delta_alpha": 0.020706143230199814,
+  "delta_beta": 0.0009129084646701813,
+  "n_real": 2000,
+  "n_fake": 800
+}
